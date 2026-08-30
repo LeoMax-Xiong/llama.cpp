@@ -979,18 +979,24 @@ float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
     return embd_layer_inp[lid].data;
 }
 
+// 返回后端（GPU）采样器为第 idx 个输出选中的 token id。
+// 无后端采样结果或 idx 无效时返回 LLAMA_TOKEN_NULL；idx 支持负索引（-1 表示最后一个输出）。
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
 
+    // 后端采样器未产生任何结果
     if (!sampling.sampled.has_data()) {
         return LLAMA_TOKEN_NULL;
     }
 
     try {
+        // 将"第 idx 个输出"解析为实际存储行号
+        // 将第 idx 的符号转化为对应的 token 的 id
         const int64_t row = output_resolve_row(idx);
         GGML_ASSERT(row < (int64_t) sampling.sampled.size);
         return sampling.sampled.data[row];
     } catch (const std::exception & err) {
+        // idx 越界或该输出未配置 logits 时记日志并返回空
         LLAMA_LOG_ERROR("%s: invalid backend sampled token id %d, reason: %s\n", __func__, idx, err.what());
         return LLAMA_TOKEN_NULL;
     }

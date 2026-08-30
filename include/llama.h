@@ -220,10 +220,11 @@ extern "C" {
     };
 
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)
+    // 一个候选 token 的数据：token id、模型输出的原始 logit 以及采样器计算的概率
     typedef struct llama_token_data {
-        llama_token id; // token id
-        float logit;    // log-odds of the token
-        float p;        // probability of the token
+        llama_token id; // token 在词表中的索引
+        float logit;    // 模型输出的该 token 的原始 logit 值（对数几率，未归一化）
+        float p;        // 该 token 的概率（由采样器计算）通常先置为 0，因为此刻还没算概率
     } llama_token_data;
 
     typedef struct llama_token_data_array {
@@ -1266,10 +1267,35 @@ extern "C" {
         struct ggml_tensor * candidates;
     };
 
-    // user code can implement the interface below in order to create custom llama_sampler
+    // llama_sampler_i 是采样器的接口表（interface）：一组函数指针，定义采样器的行为协议。
+    // 它与 llama_sampler 句柄配对使用：iface 指向接口表（决定行为），ctx 指向采样器的状态数据。
+    // 行为与状态分离，同一句柄类型通过 iface 指向不同的接口表实现多态（如 greedy、top_k、chain）。
+    // 每个具体采样器都定义一份自己的接口表实例（命名以 _i 结尾，如 llama_sampler_greedy_i），
+    // 经 llama_sampler_init 与状态数据组装成可用的 llama_sampler。
+    // 用户代码可实现本接口，以创建自定义采样器。
     struct llama_sampler_i {
         const char *           (*name)  (const struct llama_sampler * smpl);                                 // can be NULL
         void                   (*accept)(      struct llama_sampler * smpl, llama_token token);              // can be NULL
+        // apply 是接口表中唯一必需的（required）回调，定义采样器的核心功能：
+        // 对候选数组 cur_p 做就地（in-place）变换，最终通过 cur_p->selected 给出选中的候选索引。
+        // 就地变换使采样器可任意串联（链式组合）：前一个采样器的输出即后一个的输入，
+        //  可组合性（最重要的动机） ：apply 定义了一个统一的、可串联的操作协议。
+        //  采样器链（llama_sampler_chain_apply）就是按顺序把同一个 cur_p 依次传给每个采样器——前一个的输出天然是后一个的输入：                                    │
+        // cur_p ──top_k──> ──top_p──> ──temp──> ──greedy──> selected
+        // 过滤型（top_k/top_p）缩小 size，改写型（temp/penalties）调整 logit/p，选择型（greedy）设置 selected。
+        // 不返回新数组，避免采样时重复分配；参数 smpl 供采样器读取自身配置与状态。
+        // cur_p->sorted 用于在采样器间共享"已排序"信息，避免重复排序。
+        // 与 accept 的分工：apply 在采样前修改候选，accept 在采样后回传选中 token 更新状态；
+        // backend_apply 则是同一逻辑的 GPU 侧实现（在 ggml 计算图中构建算子）。
+        // @param smpl 当前采样器实例句柄：同一类型的所有实例共享一份接口表（静态全局对象），
+        //              实例的配置与状态保存在 smpl->ctx 指向的状态结构体中（如 top_k 的 k 值），
+        //              apply 通过 smpl->ctx 读取"这个实例"的配置，类似面向对象中的 this 指针；
+        //              无状态采样器（如 greedy）不使用该参数（声明处参数名被注释掉）。
+        //              总结：smpl 相当于 C++ this 指针的 C 语言实现——显式传入、手动转型、可空，
+        //              作用相同：告诉回调"正在为哪个实例工作"，以便读取该实例的配置与状态。
+        // @param cur_p 候选 token 数组（llama_token_data_array），既是输入也是输出：
+        //              过滤型（top_k/top_p）缩小 size，改写型（temp/penalties）调整 logit/p，
+        //              选择型（greedy/dist）设置 selected，最终以 cur_p->selected 输出结果。
         void                   (*apply) (      struct llama_sampler * smpl, llama_token_data_array * cur_p); // required
         void                   (*reset) (      struct llama_sampler * smpl);                                 // can be NULL
         struct llama_sampler * (*clone) (const struct llama_sampler * smpl);                                 // can be NULL if ctx is NULL
@@ -1313,6 +1339,10 @@ extern "C" {
     struct llama_sampler {
         struct llama_sampler_i * iface;
 
+        // ctx 保存该采样器实例独有的配置与状态（如 top_k 的 k 值），与共享的 iface 行为表分离，
+        // 使一份接口表可服务无数配置各异的实例。类型为 void*（不透明指针）：
+        // 具体状态结构体（如 llama_sampler_top_k）定义在实现内部，对外隐藏；
+        // 用户自定义采样器时可传入任意类型的状态数据；生命周期由 clone/free 等回调统一管理。
         llama_sampler_context_t ctx;
     };
 
@@ -1360,7 +1390,7 @@ extern "C" {
     /// seed == LLAMA_DEFAULT_SEED to use a random seed.
     LLAMA_API struct llama_sampler * llama_sampler_init_dist(uint32_t seed);
 
-    /// @details Top-K sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
+    /// @details Top-K sampling described in academic paper "Hierarchical Neural Story Generation" https://arxiv.org/abs/1805.04833
     /// Setting k <= 0 makes this a noop
     LLAMA_API struct llama_sampler * llama_sampler_init_top_k      (int32_t k);
 

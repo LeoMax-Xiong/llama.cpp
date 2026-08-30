@@ -7,32 +7,30 @@
 struct llama_vocab;
 struct llama_grammar;
 
-// sampler chain
-
+// 采样器链：按添加顺序保存一组采样器，采样时依次应用。
+// 采样器链的运行设备（is_backend 为 true）运行在后端（GPU）采样图中，
+// 其余采样器在 CPU 上依次执行。
 struct llama_sampler_chain {
-    llama_sampler_chain_params params;
+    llama_sampler_chain_params params; // 采样器链参数（如是否统计性能耗时）
 
-    // has .backend_init() been called?
+    // 是否已调用 .backend_init() 完成后端采样图初始化
     bool is_init = false;
 
-    uint32_t n_nodes = 0;
+    uint32_t n_nodes = 0; // 后端采样图的节点数
 
     struct info {
-        bool is_backend;
-
-        llama_sampler * ptr;
+        bool is_backend;      // 该采样器是否为后端采样器（运行在 GPU 上）
+        llama_sampler * ptr;  // 指向链内的采样器
     };
 
-    std::vector<info> samplers;
+    std::vector<info> samplers; // 链内采样器列表，按添加顺序排列
 
-    // pre-allocated buffer for llama_sampler_sample to avoid repeated allocations
+    // llama_sampler_sample 预分配的候选缓冲区，避免每次采样重复分配
     std::vector<llama_token_data> cur;
 
-    // timing
-
-    mutable int64_t t_sample_us;
-
-    mutable int32_t n_sample;
+    // 采样性能统计
+    mutable int64_t t_sample_us; // 累计采样耗时（微秒）
+    mutable int32_t n_sample;    // 累计采样次数
 };
 
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);

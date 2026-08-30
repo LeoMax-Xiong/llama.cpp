@@ -4418,6 +4418,9 @@ int32_t llama_tokenize(
     return vocab->tokenize(text, text_len, tokens, n_tokens_max, add_special, parse_special);
 }
 
+// 将单个 token id 解码为对应的文本片段（piece）写入 buf（llama_tokenize 的逆过程），不写结尾 '\0'。
+// lstrip：拷贝前最多跳过 lstrip 个前导空格；special 为 true 时特殊 token（如 <|endoftext|>）也以文本形式输出。
+// 返回写入的字节数；缓冲区 length 不足时返回负值，其绝对值为所需字节数。
 int32_t llama_token_to_piece(
     const struct llama_vocab * vocab,
                  llama_token   token,

@@ -17,8 +17,9 @@ int main(int argc, char ** argv) {
     // path to the model gguf file
     std::string model_path;
     // prompt to generate text from
-    std::string prompt = "Hello my name is";
+    std::string prompt = "你是谁\n";
     // number of layers to offload to the GPU
+    // ngl 表示多少层的网络使用GPU进行加速
     int ngl = 99;
     // number of tokens to predict
     int n_predict = 32;
@@ -129,6 +130,7 @@ int main(int argc, char ** argv) {
     sparams.no_perf = false;
     llama_sampler * smpl = llama_sampler_chain_init(sparams);
 
+    // 向采样器链添加贪心采样器：总是选 logit 最大的 token，输出确定、可复现
     llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
 
     // print the prompt token-by-token
@@ -179,6 +181,7 @@ int main(int argc, char ** argv) {
 
         // sample the next token
         {
+            // 对当前的上下文数据使用采样器进行处理
             new_token_id = llama_sampler_sample(smpl, ctx, -1);
 
             // is it an end of generation?

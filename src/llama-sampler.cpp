@@ -352,6 +352,9 @@ static uint32_t get_rng_seed(uint32_t seed) {
 
 // llama_sampler API
 
+// 通用采样器构造函数：用接口 iface 与内部状态 ctx 创建一个新的 llama_sampler。
+// iface 是一组函数指针，定义采样器的行为；ctx 保存采样器的具体状态。
+// 所有具体采样器（如 greedy、top_k、top_p 等）都通过本函数初始化。
 struct llama_sampler * llama_sampler_init(
         struct llama_sampler_i * iface,
         llama_sampler_context_t ctx) {
@@ -369,6 +372,8 @@ const char * llama_sampler_name(const struct llama_sampler * smpl) {
     return smpl->iface->name(smpl);
 }
 
+// 将最终选中的 token 通知采样器，供其更新内部状态（如重复惩罚历史）。
+// 空指针直接返回；接口中的 accept 回调可为空（如 greedy 无状态，无需通知）。
 void llama_sampler_accept(struct llama_sampler * smpl, llama_token token) {
     if (!smpl) {
         return;
@@ -379,11 +384,17 @@ void llama_sampler_accept(struct llama_sampler * smpl, llama_token token) {
     }
 }
 
+// 对候选 token 数组 cur_p 应用采样器 smpl 的规则（过滤/改写候选并选定一个 token）。
+// 若 smpl 是采样器链，则按链内顺序依次应用各采样器；smpl 为空指针时直接返回。
+// 补说明一下这个函数的本质：它是一个分发包装函数，本身不实现任何采样逻辑，
+// 只是把调用转发到采样器接口 llama_sampler_i 里的 apply 回调。真正的采样行为（top-k、top-p、重复惩罚等）由各采样器自己的 apply 实现完成；
+// 若是 llama_sampler_chain，其 apply 实现会遍历链内每个采样器并依次调用。代码逻辑未做任何改动。
 void llama_sampler_apply(struct llama_sampler * smpl, struct llama_token_data_array * cur_p) {
     if (!smpl) {
         return;
     }
 
+    // apply 是采样器必需的核心回调，不允许为空
     GGML_ASSERT(smpl->iface->apply);
     smpl->iface->apply(smpl, cur_p);
 }
@@ -502,6 +513,11 @@ static void llama_sampler_empty_backend_set_input(struct llama_sampler * smpl) {
     GGML_UNUSED(smpl);
 }
 
+// 空采样器的接口表：所有回调均为空操作或无害默认值，即"什么都不做"的采样器。
+// 当采样器参数配置为禁用状态时（如 top_k 的 k <= 0），llama_sampler_init_top_k 等
+// 返回 llama_sampler_init_empty("?top-k") 作为占位，名称带 "?" 前缀便于日志识别。
+// 设计目的：避免返回 nullptr，使采样器链中每个位置始终是有效对象，调用方无需空指针检查；
+// backend_init 恒返回 true（空操作对任何后端都"支持"），backend 回调均为空操作。
 static struct llama_sampler_i llama_sampler_empty_i = {
     /* .name              = */ llama_sampler_empty_name,
     /* .accept            = */ llama_sampler_empty_accept,
@@ -526,10 +542,10 @@ struct llama_sampler * llama_sampler_init_empty(const char * name) {
     );
 }
 
-// common backend sampler functionality
+// 后端采样器的公共功能（基类），供可运行在后端（GPU）上的采样器继承
 //
-// +name : means that the sampler is support and will run on the backend
-// -name : means that a ggml operator is not supported by the backend
+// +name：该采样器受后端支持，将运行在后端（GPU）上
+// -name：该采样器包含后端不支持的 ggml 算子，将回退到 CPU 运行
 //
 struct llama_sampler_backend {
     llama_sampler_backend(const char * name) : name(name), name_ext(name), is_init(false), support(false) {}
@@ -539,6 +555,7 @@ struct llama_sampler_backend {
             return name.c_str();
         }
 
+        // 按后端支持情况加 "+"/"-" 前缀，便于在日志中识别
         if (support) {
             name_ext = "+" + name;
         } else {
@@ -548,6 +565,7 @@ struct llama_sampler_backend {
         return name_ext.c_str();
     }
 
+    // 记录后端初始化结果，只能调用一次
     void init(bool support) {
         GGML_ASSERT(this->is_init == false);
 
@@ -555,18 +573,16 @@ struct llama_sampler_backend {
         this->support = support;
     }
 
-    // copy the state that is not tied to the current sampling graph
-    // samplers that hold only immutable configuration can use this as is
+    // 复制与当前采样图无关的状态；只持有不可变配置的采样器可直接使用默认实现
     void copy_state(const llama_sampler_backend & src) {
         GGML_UNUSED(src);
     }
 
 private:
-    std::string name;
-    std::string name_ext;
-
-    bool is_init;
-    bool support;
+    std::string name;     // 采样器原始名称，如 "top_k"
+    std::string name_ext; // 带 "+"/"-" 前缀的扩展名称，由 get_name() 生成
+    bool is_init;         // 是否已完成后端初始化
+    bool support;         // 后端是否支持该采样器
 };
 
 // .copy_state for samplers deriving from llama_sampler_backend
@@ -662,6 +678,8 @@ static bool llama_sampler_backend_support(
 
 // sampler chain
 
+// 采样器链的 name 回调：链的名称固定为 "chain"，不依赖具体实例，
+// 供 llama_sampler_name() 在日志、调试与性能分析中标识采样器。
 static const char * llama_sampler_chain_name(const struct llama_sampler * /*smpl*/) {
     return "chain";
 }
@@ -678,25 +696,41 @@ static void llama_sampler_chain_accept(struct llama_sampler * smpl, llama_token 
     chain->n_sample++;
 }
 
+// 采样器链的 apply 实现：依次对候选数组 cur_p 应用链内各采样器。
+// 链前部标记为后端采样器（is_backend）的采样器已在 GPU 采样图中执行过，这里跳过；
+// 一旦遇到非后端采样器，其后的采样器（含带后端标记的）都回退到 CPU 上执行。
 static void llama_sampler_chain_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    // smpl 相当于采样器连的this->指针
+    // 下面的方式是得到当前采样器链的数据
     auto * chain = (llama_sampler_chain *) smpl->ctx;
 
+    // 统计本函数耗时（no_perf 为 false 时）
     time_meas tm(chain->t_sample_us, chain->params.no_perf);
 
+    // 后端采样图已初始化时，链前部的后端采样器已在 GPU 上处理过
     bool is_backend = chain->is_init;
 
-    for (auto & smpl : chain->samplers) {
-        if (is_backend && smpl.is_backend) {
+    // smpl_inst 是当前采样器链中的每一个采样器
+    for (auto & smpl_inst : chain->samplers) {
+        // 跳过已在 GPU 采样图中执行过的后端采样器
+        if (is_backend && smpl_inst.is_backend) {
             continue;
         }
 
+        // 从第一个非后端采样器起，后续采样器全部在 CPU 上执行
         is_backend = false;
 
-        if (smpl.ptr->iface->apply == nullptr) {
+        // 跳过没有 apply 回调的采样器
+        // sampl.ptr 是具体的采样器的指针
+        // sampl.ptr->iface 是当前采样器对应的请求信息
+        // sampl.prt->iface->apply 是当前采样器对应请求请求对于采样器的回调函数
+        //                         如果这个请求设置了要应用采样器回调函数，那么才进行接下来的处理
+        if (smpl_inst.ptr->iface->apply == nullptr) {
             continue;
         }
 
-        llama_sampler_apply(smpl.ptr, cur_p);
+        // 调用每一个真实的采样器
+        llama_sampler_apply(smpl_inst.ptr, cur_p);
     }
 }
 
@@ -852,6 +886,11 @@ static void llama_sampler_chain_copy_state(const struct llama_sampler * src, str
     dst_chain->n_sample    = src_chain->n_sample;
 }
 
+// 采样器链的接口表：链本身也是一个采样器，实现完整的 llama_sampler_i 接口，
+// 使链对外表现为单个采样器，可被 llama_sampler_apply/sample 等通用逻辑直接使用。
+// 内部行为是"分发"：apply/accept/reset 等回调依次转发给链内各采样器；
+// backend_* 回调负责把链前部的后端采样器并入 GPU 采样图，其余回退到 CPU 执行。
+// 与普通采样器一样经 llama_sampler_init 组装（iface + 链状态 ctx），无特殊处理。
 static struct llama_sampler_i llama_sampler_chain_i = {
     /* .name              = */ llama_sampler_chain_name,
     /* .accept            = */ llama_sampler_chain_accept,
@@ -867,6 +906,10 @@ static struct llama_sampler_i llama_sampler_chain_i = {
     /* .copy_state        = */ llama_sampler_chain_copy_state,
 };
 
+// 创建空的采样器链：返回可用的链式采样器句柄，链内采样器列表初始为空，
+// 之后通过 llama_sampler_chain_add 按顺序追加采样器（如 top_k、top_p、temp 等），采样时依次应用。
+// 复用 llama_sampler_init 组装链接口表 llama_sampler_chain_i 与初始状态
+// （未初始化、空采样器列表、计时统计清零）。
 struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_params params) {
     return llama_sampler_init(
         /* .iface = */ &llama_sampler_chain_i,
@@ -892,13 +935,18 @@ uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler) {
     return chain->n_nodes;
 }
 
+// 对上次 llama_decode 的第 idx 个输出执行采样，返回选中的 token id。
+// 若后端（GPU）采样器已采样出 token，则直接接受并返回，跳过 CPU 采样器；
+// 否则从 logits 构造候选 token 数组，依次应用采样器链中的各采样器（温度、top-k、top-p 等），
+// 接受选中的 token 并返回。
 llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx) {
+    // 取后端采样器为本输出产生的结果（未启用后端采样时为空）
     const llama_token   sampled_token  = llama_get_sampled_token_ith     (ctx, idx);
     const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
     const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
     const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
 
-    // If a backend sampler has already sampled a token, return it.
+    // 后端采样器已采样出 token，直接接受并返回
     if (sampled_token != LLAMA_TOKEN_NULL) {
         LLAMA_LOG_DEBUG("%s: Backend sampler selected token for idx %d. Skipping CPU samplers\n", __func__, idx);
         llama_sampler_accept(smpl, sampled_token);
@@ -910,7 +958,7 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
 
     const int n_vocab = llama_vocab_n_tokens(vocab);
 
-    // use pre-allocated buffer from chain if available, otherwise allocate locally
+    // 优先复用采样器链的预分配缓冲区，避免每次采样都重新分配
     std::vector<llama_token_data> * cur_ptr;
     std::vector<llama_token_data> cur_local;
 
@@ -923,6 +971,10 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
 
     auto & cur = *cur_ptr;
 
+    // 用可用的数据源填充候选 token 数组：
+    // - 有 probs：候选 id + logits + probs
+    // - 只有 logits：候选 id + logits，probs 置 0
+    // - 都没有：用完整词表的 logits
     if (sampled_probs) {
         const uint32_t sampled_probs_count = llama_get_sampled_probs_count_ith(ctx, idx);
         cur.resize(sampled_probs_count);
@@ -939,11 +991,16 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
         const auto * logits = llama_get_logits_ith(ctx, idx);
         GGML_ASSERT(logits != nullptr);
         cur.resize(n_vocab);
+        // 模型只输出原始 logits，这里把词表中每个 token 包装成候选结构：
+        // 填入 token id 和对应 logit，概率先置 0，留待采样器计算
+        // 整个循环的效果就是：把词表里每个 token 的 {id, logit, p=0} 依次填入 cur，得到一个覆盖完整词表（n_vocab 个）的候选数组。
+        // 之后 llama_sampler_apply 会运行采样器链，采样器（如 softmax、top-k、top-p）会修改这些 p 值并最终通过 cur_p.selected 选出 token。
         for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
             cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
         }
     }
 
+    // 记录当前解码的数据
     llama_token_data_array cur_p = {
         /* .data       = */ cur.data(),
         /* .size       = */ cur.size(),
@@ -951,18 +1008,23 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
         /* .sorted     = */ false,
     };
 
+    // 依次应用采样器链，选出最终 token（选中索引写入 cur_p.selected）
     llama_sampler_apply(smpl, &cur_p);
 
+    // 校验采样器选中的索引有效
     GGML_ASSERT(cur_p.selected >= 0 && cur_p.selected < (int32_t) cur_p.size);
 
     auto token = cur_p.data[cur_p.selected].id;
 
+    // 将选中的 token 通知采样器链，更新其内部状态（如重复惩罚）
     llama_sampler_accept(smpl, token);
 
     return token;
 }
 
 
+// 将采样器 smpl 追加到采样器链 chain 的末尾，链按添加顺序依次应用各采样器。
+// is_backend 初始为 false，之后由 llama_sampler_chain_backend_init 按后端支持情况重新标记。
 void llama_sampler_chain_add(struct llama_sampler * chain, struct llama_sampler * smpl) {
     auto * p = (llama_sampler_chain *) chain->ctx;
     p->samplers.push_back({
@@ -1050,7 +1112,10 @@ static void llama_sampler_greedy_free(struct llama_sampler * smpl) {
     delete (llama_sampler_greedy *) smpl->ctx;
 }
 
+// 贪心采样：线性扫描候选数组，选出 logit 最大的 token，写入 cur_p->selected。
+// 不做随机抽样，总是返回 logit 最高的候选，用于确定性解码。
 static void llama_sampler_greedy_apply(struct llama_sampler * /*smpl*/, llama_token_data_array * cur_p) {
+    // 先假设第一个候选的 logit 最大，再逐个比较更新
     cur_p->selected = 0;
     for (size_t i = 1; i < cur_p->size; ++i) {
         if (cur_p->data[i].logit > cur_p->data[cur_p->selected].logit) {
@@ -1089,6 +1154,12 @@ static void llama_sampler_greedy_backend_apply(
     data->sampled = curl;
 }
 
+// greedy（贪心）采样器的接口表：总是选择 logit 最大的 token，确定性解码。
+// 无状态采样器：accept/reset/backend_accept 均为 nullptr 或空操作，无需记录历史。
+// apply（CPU）线性扫描候选数组选最大值；backend_apply（GPU）用 ggml_argmax 在
+// 计算图中求最大值，两者是同一逻辑的 CPU/GPU 双实现。
+// 状态继承 llama_sampler_backend 基类，复用名称管理与后端支持记录；
+// copy_state 使用模板辅助函数 llama_sampler_backend_copy_state 做通用状态复制。
 static struct llama_sampler_i llama_sampler_greedy_i = {
     /* .name              = */ llama_sampler_greedy_name,
     /* .accept            = */ nullptr,
@@ -1104,10 +1175,13 @@ static struct llama_sampler_i llama_sampler_greedy_i = {
     /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_greedy>,
 };
 
+/*
+ * 初始化贪心解码的采样器
+ */
 struct llama_sampler * llama_sampler_init_greedy() {
     return llama_sampler_init(
-        /* .iface = */ &llama_sampler_greedy_i,
-        /* .ctx   = */ new llama_sampler_greedy {
+        /* .iface = */ &llama_sampler_greedy_i,             // 初始化贪心解码采样器的虚函数表
+        /* .ctx   = */ new llama_sampler_greedy {           // 初始化贪心解码的数据上下文内容
             ("greedy"),
         }
     );
