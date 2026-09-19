@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Qwen3 计算流程可视化 - llama.cpp</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <h1>计算图与推理流程可视化<span class="sub">llama.cpp</span></h1>
+  <span class="model-badge"><span class="dot"></span>Qwen3-0.6B · 28 层 · GQA 16/8</span>
+  <nav class="stage-nav" id="tabs"></nav>
+</header>
+
+<main>
+  <!-- 左：说明与概念 -->
+  <section class="panel">
+    <h2>本阶段步骤<span id="stage-sub" style="float:right;text-transform:none;color:var(--text-faint)"></span></h2>
+    <ul class="step-list" id="steps"></ul>
+    <h2>关键概念</h2>
+    <div id="concepts"></div>
+    <h2>当前步骤</h2>
+    <p class="step-title" id="step-title"></p>
+    <p class="step-desc" id="step-desc"></p>
+  </section>
+
+  <!-- 中：可视化舞台 -->
+  <section class="stage">
+    <div class="stage-head" id="stage-head"></div>
+    <div class="viz" id="viz"></div>
+  </section>
+
+  <!-- 右：日志与参数 -->
+  <aside class="panel">
+    <h2>运行日志（模拟）</h2>
+    <pre class="log" id="log"></pre>
+    <h2 style="margin-top:20px">模型参数</h2>
+    <div class="params">
+      <div class="p"><span>arch</span><span>qwen3</span></div>
+      <div class="p"><span>n_layer</span><span>28</span></div>
+      <div class="p"><span>n_embd</span><span>1024</span></div>
+      <div class="p"><span>n_head / n_head_kv</span><span>16 / 8</span></div>
+      <div class="p"><span>head_dim</span><span>128</span></div>
+      <div class="p"><span>n_ff</span><span>3072</span></div>
+      <div class="p"><span>n_vocab</span><span>151936</span></div>
+      <div class="p"><span>rope_theta</span><span>1e6</span></div>
+      <div class="p"><span>ctx_length</span><span>40960</span></div>
+    </div>
+    <p class="step-desc" style="margin-top:14px;font-size:11.5px">
+      参数取自 Qwen3-0.6B 的 config.json 与 GGUF 元数据。
+      日志、split 划分、采样概率等为教学示意，不代表真实运行输出。
+    </p>
+  </aside>
+</main>
+
+<footer>
+  <button class="btn" id="btn-prev">上一步</button>
+  <button class="btn primary" id="btn-next">下一步</button>
+  <button class="btn" id="btn-play">自动播放</button>
+  <button class="btn" id="btn-reset">重置</button>
+  <div class="progress-wrap"><div class="progress" id="progress"></div></div>
+  <span class="status" id="status"></span>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
