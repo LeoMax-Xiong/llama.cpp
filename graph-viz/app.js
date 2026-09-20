@@ -6,8 +6,21 @@
   'use strict';
 
   // ---------------------------------------------------------------- 模型参数
+  // 默认值为 Qwen3-0.6B；用户加载 GGUF 后由 setModelFromGGUF() 覆盖各字段。
   var MODEL = {
+    source: 'default',                 // 'default' | 'loaded'
     name: 'Qwen3-0.6B',
+    fileName: 'qwen3-0.6b.gguf',
+    fileSize: 1509347584,
+    magic: 'GGUF',
+    version: 3,
+    nTensors: 311,
+    nKv: 37,
+    headerBytes: null,                 // 加载后填充（kv 段 + tensor info 段结束偏移）
+    kvEnd: null,                       // 加载后填充（kv 段结束偏移 = tensor info 段起点）
+    alignment: 32,
+    meta: null,                        // 加载后：完整 metadata 数组
+    tensors: null,                     // 加载后：完整 tensor 数组
     arch: 'qwen3',
     layers: 28,
     hidden: 1024,
@@ -22,10 +35,13 @@
     fileType: 'F16'
   };
 
-  // KV cache 大小：n_ctx * n_layer * n_kv_heads * head_dim * 2(K,V) * 2字节(f16)
+  function isLoaded() { return MODEL.source === 'loaded'; }
+
+  // KV cache 大小：n_ctx（演示假设值）* n_layer * n_kv_heads * head_dim * 2(K,V) * 2字节(f16)
   var KV_DEMO_CTX = 4096;
-  var kvBytes = KV_DEMO_CTX * MODEL.layers * MODEL.kvHeads * MODEL.headDim * 2 * 2;
-  var kvMiB = Math.round(kvBytes / 1024 / 1024);
+  function kvMiB() {
+    return Math.round(KV_DEMO_CTX * MODEL.layers * MODEL.kvHeads * MODEL.headDim * 2 * 2 / 1024 / 1024);
+  }
 
   // ---------------------------------------------------------------- 工具函数
   function esc(s) {
@@ -37,6 +53,277 @@
   }
   function arrow() { return '<span class="arrow">-&gt;</span>'; }
   function row(nodes) { return '<div class="rowline">' + nodes.join(arrow()) + '</div>'; }
+  function fmtBytes(n) {
+    if (n == null) return '-';
+    if (n >= 1024 * 1024 * 1024) return (n / 1024 / 1024 / 1024).toFixed(2) + ' GiB';
+    if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(2) + ' MiB';
+    if (n >= 1024) return (n / 1024).toFixed(1) + ' KiB';
+    return n + ' B';
+  }
+  function metaGet(meta, key) {
+    if (!meta) return undefined;
+    for (var i = 0; i < meta.length; i++) if (meta[i].key === key) return meta[i].value;
+    return undefined;
+  }
+  function fmtMetaValue(v) {
+    if (v && v.__array) {
+      var shown = Math.min(6, v.count);
+      var s = v.sample.slice(0, shown).map(function (x) {
+        return typeof x === 'string' ? '"' + x + '"' : String(x);
+      }).join(', ');
+      return 'ARRAY(' + v.elemType + ') x ' + v.count + ' [' + s + (v.count > shown ? ', ...' : '') + ']';
+    }
+    if (typeof v === 'string') return '"' + v + '"';
+    return String(v);
+  }
+  function fmtMetaShort(v) {
+    if (v && v.__array) return v.elemType + '[' + v.count + ']';
+    if (typeof v === 'string') return v;
+    return String(v);
+  }
+  // 按张量名推断用途，用于着色
+  function tensorCls(name) {
+    if (/token_embd/.test(name)) return 'weight';
+    if (/attn_(q|k|v|output)/.test(name) || /attn_qkv/.test(name)) return 'attn';
+    if (/ffn_/.test(name)) return 'mlp';
+    if (/norm/.test(name)) return 'norm';
+    if (/^output\./.test(name)) return 'out';
+    return '';
+  }
+  // GGUF general.file_type -> 名称
+  var FILE_TYPE = {
+    0: 'ALL_F32', 1: 'MOSTLY_F16', 2: 'MOSTLY_Q4_0', 3: 'MOSTLY_Q4_1', 4: 'MOSTLY_Q5_0',
+    5: 'MOSTLY_Q5_1', 6: 'MOSTLY_Q8_0', 7: 'MOSTLY_Q2_K', 8: 'MOSTLY_Q3_K_S', 9: 'MOSTLY_Q3_K_M',
+    10: 'MOSTLY_Q3_K_L', 11: 'MOSTLY_Q4_K_S', 12: 'MOSTLY_Q4_K_M', 13: 'MOSTLY_Q5_K_S',
+    14: 'MOSTLY_Q5_K_M', 15: 'MOSTLY_Q6_K'
+  };
+
+  // 用解析出的 GGUF 信息更新 MODEL（全页面的单一数据源）
+  function setModelFromGGUF(info, file) {
+    var m = info.metadata;
+    var arch = metaGet(m, 'general.architecture') || MODEL.arch;
+    MODEL.source = 'loaded';
+    MODEL.fileName = file.name;
+    MODEL.fileSize = file.size;
+    MODEL.magic = info.magic;
+    MODEL.version = info.version;
+    MODEL.nTensors = info.nTensors;
+    MODEL.nKv = info.nKv;
+    MODEL.headerBytes = info.headerBytes;
+    MODEL.kvEnd = info.kvEnd;
+    MODEL.alignment = info.alignment;
+    MODEL.meta = m;
+    MODEL.tensors = info.tensors;
+    MODEL.arch = arch;
+    MODEL.layers  = metaGet(m, arch + '.block_count')             || MODEL.layers;
+    MODEL.hidden  = metaGet(m, arch + '.embedding_length')        || MODEL.hidden;
+    MODEL.heads   = metaGet(m, arch + '.attention.head_count')    || MODEL.heads;
+    MODEL.kvHeads = metaGet(m, arch + '.attention.head_count_kv') || MODEL.heads;
+    MODEL.headDim = metaGet(m, arch + '.attention.key_length')    || Math.round(MODEL.hidden / MODEL.heads);
+    MODEL.ffn     = metaGet(m, arch + '.feed_forward_length')     || MODEL.ffn;
+    MODEL.ropeTheta = metaGet(m, arch + '.rope.freq_base')        || MODEL.ropeTheta;
+    MODEL.ctxLen  = metaGet(m, arch + '.context_length')          || MODEL.ctxLen;
+    var toks = metaGet(m, 'tokenizer.ggml.tokens');
+    if (toks && toks.__array) MODEL.vocab = toks.count;
+    var eos = metaGet(m, 'tokenizer.ggml.eos_token_id');
+    if (eos != null) MODEL.eos = eos;
+    var ft = metaGet(m, 'general.file_type');
+    if (ft != null) MODEL.fileType = FILE_TYPE[ft] || ('TYPE_' + ft);
+    var nm = metaGet(m, 'general.name');
+    MODEL.name = nm ? String(nm).trim() : file.name;
+  }
+
+  // ---------------------------------------------------------- GGUF 元数据字段解释
+  // '[arch]' 匹配任意架构前缀（qwen3. / llama. / qwen2. 等）
+  var META_DESC = {
+    // general
+    'general.architecture': '模型架构名称（如 qwen3、llama）',
+    'general.name': '模型完整名称',
+    'general.basename': '模型基础名（不含版本/尺寸）',
+    'general.size_label': '参数量标注（如 0.6B、8B）',
+    'general.version': '模型版本号',
+    'general.finetune': '微调目标（如 instruct、chat）',
+    'general.type': '文件用途类型（model / lora / vocab）',
+    'general.organization': '模型组织/发布者',
+    'general.author': '模型作者',
+    'general.license': '许可证名称',
+    'general.license.name': '许可证名称',
+    'general.license.link': '许可证链接',
+    'general.url': '模型主页地址',
+    'general.repo_url': '模型仓库地址',
+    'general.description': '模型描述',
+    'general.tags': '标签数组',
+    'general.languages': '支持的语言',
+    'general.file_type': '权重主要量化类型（如 F16、Q4_K_M）',
+    'general.quantization_version': '量化方案版本号',
+    'general.alignment': '数据对齐字节数（data 段填充到该倍数）',
+    'general.parameter_count': '参数总量',
+    'general.sampling.top_k': '推荐采样参数：top-k',
+    'general.sampling.top_p': '推荐采样参数：top-p',
+    'general.sampling.temp': '推荐采样参数：温度 temperature',
+    'general.base_model.count': '基座模型条目数',
+    'general.base_model.N.name': '基座模型名称',
+    'general.base_model.N.organization': '基座模型所属组织',
+    'general.base_model.N.repo_url': '基座模型仓库地址',
+    'general.base_model.N.version': '基座模型版本',
+    // [arch] 结构参数
+    '[arch].context_length': '最大上下文长度（token 数）',
+    '[arch].block_count': 'Transformer 层数（n_layer）',
+    '[arch].embedding_length': '隐藏层维度（n_embd）',
+    '[arch].feed_forward_length': '前馈网络中间维度（n_ff）',
+    '[arch].vocab_size': '词表大小',
+    '[arch].attention.head_count': '注意力头数（n_head）',
+    '[arch].attention.head_count_kv': 'KV 头数（GQA，多个 Q 头共享）',
+    '[arch].attention.key_length': '每个 K 头维度（head_dim）',
+    '[arch].attention.value_length': '每个 V 头维度',
+    '[arch].attention.layer_norm_epsilon': 'LayerNorm 的 epsilon',
+    '[arch].attention.layer_norm_rms_epsilon': 'RMSNorm 的 epsilon（数值稳定项）',
+    '[arch].attention.clamp_kqv': 'Q/K/V 数值裁剪范围',
+    '[arch].attention.alibi_bias_max': 'ALiBi 最大偏置',
+    '[arch].attention.max_alibi_bias': 'ALiBi 最大偏置',
+    '[arch].attention.sliding_window': '滑动窗口大小',
+    '[arch].attention.sliding_window_pattern': '滑窗与全注意力的交替模式',
+    '[arch].rope.dimension_count': 'RoPE 旋转维数',
+    '[arch].rope.freq_base': 'RoPE 位置编码基础频率',
+    '[arch].rope.scaling.type': 'RoPE 缩放类型（none / linear / yarn）',
+    '[arch].rope.scaling.factor': 'RoPE 缩放因子（用于扩展上下文）',
+    '[arch].rope.scaling.original_context_length': 'RoPE 缩放前的原始上下文长度',
+    '[arch].rope.scale_linear': 'RoPE 线性缩放因子（旧键）',
+    '[arch].expert_count': 'MoE 专家总数',
+    '[arch].expert_used_count': '每个 token 激活的专家数',
+    '[arch].expert_shared_count': '共享专家数',
+    '[arch].expert_feed_forward_length': '专家前馈中间维度',
+    '[arch].expert_ffn_length': '专家前馈中间维度',
+    '[arch].use_parallel_residual': '是否使用并行残差',
+    '[arch].tensor_data_layout': '权重张量布局约定',
+    '[arch].pooling_type': '池化类型（embedding 模型）',
+    '[arch].ssm.conv_kernel': 'SSM 卷积核大小（Mamba）',
+    '[arch].ssm.inner_size': 'SSM 内部状态维度',
+    '[arch].ssm.state_size': 'SSM 循环状态大小',
+    '[arch].ssm.time_step_rank': 'SSM 时间步秩',
+    // tokenizer
+    'tokenizer.ggml.model': '分词器模型类型（llama / gpt2 / rwkv）',
+    'tokenizer.ggml.pre': '分词预处理规则名（如 qwen2、llama-bpe）',
+    'tokenizer.ggml.tokens': '词表：token id 到文本的映射',
+    'tokenizer.ggml.scores': '每个 token 的分数（SentencePiece）',
+    'tokenizer.ggml.token_type': '每个 token 的类型（普通/控制/未知等）',
+    'tokenizer.ggml.merges': 'BPE 合并规则表',
+    'tokenizer.ggml.added_tokens': '训练后追加的 token',
+    'tokenizer.ggml.bos_token_id': '起始符（BOS）token id',
+    'tokenizer.ggml.eos_token_id': '结束符（EOS）token id',
+    'tokenizer.ggml.unknown_token_id': '未知符（UNK）token id',
+    'tokenizer.ggml.separator_token_id': '分隔符 token id',
+    'tokenizer.ggml.padding_token_id': '填充符（PAD）token id',
+    'tokenizer.ggml.add_bos_token': '是否自动添加 BOS',
+    'tokenizer.ggml.add_eos_token': '是否自动添加 EOS',
+    'tokenizer.ggml.add_space_prefix': '是否给 token 片段添加空格前缀',
+    'tokenizer.ggml.remove_extra_whitespaces': '是否移除多余空白',
+    'tokenizer.ggml.precompiled_charsmap': '预编译字符映射（SentencePiece）',
+    'tokenizer.chat_template': '对话模板（Jinja 字符串）',
+    'tokenizer.huggingface.json': '内嵌的 HF tokenizer.json'
+  };
+
+  // 按字段名查中文解释；未收录返回 '-'
+  function metaDesc(key) {
+    if (META_DESC[key] !== undefined) return META_DESC[key];
+    var bm = /^general\.base_model\.\d+\.(.+)$/.exec(key);
+    if (bm) return META_DESC['general.base_model.N.' + bm[1]] || '-';
+    if (/^(general|tokenizer)\./.test(key)) return '-';
+    var i = key.indexOf('.');
+    if (i > 0) {
+      var v = META_DESC['[arch]' + key.slice(i)];
+      if (v !== undefined) return v;
+    }
+    return '-';
+  }
+
+  // ---------------------------------------------------------- GGUF 文件结构图
+  function alignUp(n, a) { return Math.ceil(n / a) * a; }
+  // "GGUF" -> 小端 u32 值 0x46554747
+  function magicLE(s) {
+    var v = 0;
+    for (var i = 0; i < s.length; i++) v += s.charCodeAt(i) * Math.pow(256, i);
+    return '0x' + v.toString(16).toUpperCase();
+  }
+  function gfield(name, type, value, note, color) {
+    return '<div class="gguf-field ' + (color || '') + '">' +
+           '<div class="fn">' + esc(name) + '</div>' +
+           '<div class="ft">' + esc(type) + '</div>' +
+           '<div class="fv">' + esc(value) + '</div>' +
+           '<div class="gnote">' + (note ? esc(note) : '') + '</div></div>';
+  }
+  // 按字节顺序绘制 GGUF 布局；数值随 MODEL 联动，未加载时显示占位
+  function renderGGUFLayout() {
+    var HDR = 24;
+    var kvBytes = MODEL.kvEnd != null ? MODEL.kvEnd - HDR : null;
+    var tiBytes = (MODEL.kvEnd != null && MODEL.headerBytes != null) ? MODEL.headerBytes - MODEL.kvEnd : null;
+    var dataOff = MODEL.headerBytes != null ? alignUp(MODEL.headerBytes, MODEL.alignment) : null;
+    var padBytes = dataOff != null ? dataOff - MODEL.headerBytes : null;
+
+    function size(v) { return v == null ? '加载后显示' : fmtBytes(v) + ' = ' + v.toLocaleString() + ' B'; }
+
+    var kvSample = (isLoaded() && MODEL.meta && MODEL.meta.length)
+      ? '首项 ' + MODEL.meta[0].key + ' = ' + fmtMetaShort(MODEL.meta[0].value)
+      : '每项 = key(string) + value_type(u32) + value(变长)';
+    var tiSample = (isLoaded() && MODEL.tensors && MODEL.tensors.length)
+      ? '首项 ' + MODEL.tensors[0].name + ' [' + MODEL.tensors[0].dims.join(', ') + '] ' + MODEL.tensors[0].type
+      : '每项 = name + n_dimensions + dimensions + type + offset';
+
+    return '<div class="gguf-diagram">' +
+      '<div class="gguf-diagram-head">GGUF 文件结构（依据 ggml <code>docs/gguf.md</code> 规范绘制，自上而下为字节顺序）' +
+        (isLoaded() ? ' · <span style="color:var(--green)">实测</span>' : ' · <span style="color:var(--yellow)">示例</span>') + '</div>' +
+
+      '<div class="gguf-seg hdr">' +
+        '<div class="gguf-seg-head"><span>gguf_header_t（文件头）</span><span class="gguf-seg-size">' + HDR + ' B（固定）</span></div>' +
+        '<div class="gguf-fields hdr">' +
+          gfield('magic', 'u32 · 4 B', magicLE(MODEL.magic),
+            '字节为 47 47 55 46（"GGUF"），按小端 u32 读出即 ' + magicLE(MODEL.magic), 'r-blue') +
+          gfield('version', 'u32 · 4 B', MODEL.version, '', 'r-purple') +
+          gfield('tensor_count', 'u64 · 8 B', MODEL.nTensors, '', 'r-green') +
+          gfield('metadata_kv_count', 'u64 · 8 B', MODEL.nKv, '', 'r-yellow') +
+        '</div>' +
+      '</div>' +
+
+      '<div class="gguf-seg kv">' +
+        '<div class="gguf-seg-head"><span>gguf_metadata_kv_t[metadata_kv_count]（元数据段）</span><span class="gguf-seg-size">' + size(kvBytes) + '</span></div>' +
+        '<div class="gguf-fields cols3">' +
+          gfield('key', 'gguf_string_t', 'u64 len + bytes') +
+          gfield('value_type', 'u32 · 4 B', '0..12') +
+          gfield('value', '变长', '按 value_type') +
+        '</div>' +
+        '<div class="gguf-note">共 ' + MODEL.nKv + ' 项 · ' + esc(kvSample) + '</div>' +
+      '</div>' +
+
+      '<div class="gguf-seg ti">' +
+        '<div class="gguf-seg-head"><span>tensor_info[tensor_count]（张量描述表）</span><span class="gguf-seg-size">' + size(tiBytes) + '</span></div>' +
+        '<div class="gguf-fields cols5">' +
+          gfield('name', 'gguf_string_t', 'u64 len + bytes') +
+          gfield('n_dimensions', 'u32 · 4 B', '维数') +
+          gfield('dimensions[n]', 'u64 × n', '各维大小') +
+          gfield('type', 'ggml_type · u32', '如 F16') +
+          gfield('offset', 'u64 · 8 B', '相对 data') +
+        '</div>' +
+        '<div class="gguf-note">共 ' + MODEL.nTensors + ' 项 · ' + esc(tiSample) + '</div>' +
+      '</div>' +
+
+      '<div class="gguf-seg pad">' +
+        '<div class="gguf-seg-head"><span>padding（对齐填充）</span><span class="gguf-seg-size">' + size(padBytes) + '</span></div>' +
+        '<div class="gguf-note">以 0x00 填充，使张量数据起点对齐到 general.alignment = ' + MODEL.alignment + '</div>' +
+      '</div>' +
+
+      '<div class="gguf-seg data">' +
+        '<div class="gguf-seg-head"><span>tensor_data（权重数据）</span><span class="gguf-seg-size">' +
+          (MODEL.fileSize != null && dataOff != null
+            ? fmtBytes(MODEL.fileSize - dataOff) + ' = ' + (MODEL.fileSize - dataOff).toLocaleString() + ' B'
+            : '加载后显示') +
+        '</span></div>' +
+        '<div class="gguf-note">' +
+          (dataOff != null ? '起始偏移 ' + dataOff.toLocaleString() + ' B；' : '') +
+          '各权重按各自的 offset 排列于此，可 mmap 直接映射</div>' +
+      '</div>' +
+
+    '</div>';
+  }
 
   // ---------------------------------------------------------------- 日志面板
   var Log = {
@@ -53,6 +340,7 @@
 
   // ---------------------------------------------------------------- 左侧说明
   function concepts(items) {
+    if (typeof items === 'function') items = items();
     return items.map(function (it) {
       return '<div class="concept-card"><b>' + esc(it[0]) + '</b><br>' + it[1] + '</div>';
     }).join('');
@@ -68,133 +356,185 @@
         ['张量(Tensor)', '模型的权重矩阵，如 <code>blk.0.attn_q.weight</code>'],
         ['元数据(kv)', '架构、层数、词表大小等超参数，以 key-value 形式存储']
       ],
-      logs: [
-        { cls: 'l-load', text: 'llama_model_loader: loaded meta data with 28 key-value pairs and 291 tensors' },
-        { cls: 'l-load', text: 'llama_model_loader: - kv   0: general.architecture       str              = qwen3' },
-        { cls: 'l-info', text: 'llama_model_loader: - kv   1: general.name                 str              = Qwen3-0.6B' },
-        { cls: 'l-info', text: 'llama_model_loader: - kv   2: general.file_type            u32              = 1 (F16)' },
-        { cls: 'l-info', text: 'llama_model_loader: - kv   3: qwen3.block_count            u32              = 28' },
-        { cls: 'l-info', text: 'llama_model_loader: - kv   4: qwen3.embedding_length       u32              = 1024' }
-      ],
+      logs: function () {
+        var out = [{ cls: 'l-load', text: 'llama_model_loader: loaded meta data with ' + MODEL.nKv + ' key-value pairs and ' + MODEL.nTensors + ' tensors' }];
+        if (isLoaded()) {
+          for (var i = 0; i < Math.min(5, MODEL.meta.length); i++) {
+            var m = MODEL.meta[i];
+            out.push({ cls: 'l-info', text: 'llama_model_loader: - kv ' + i + ': ' + m.key + ' = ' + fmtMetaShort(m.value) });
+          }
+        } else {
+          out.push({ cls: 'l-time', text: '（当前为示例数据，点击左侧【加载模型】可解析真实 GGUF 文件）' });
+        }
+        return out;
+      },
       render: function (box) {
+        var badge = isLoaded()
+          ? ' <span style="color:var(--green);font-size:11px">实测</span>'
+          : ' <span style="color:var(--yellow);font-size:11px">示例</span>';
         box.innerHTML =
           '<div class="file-card">' +
             '<div class="file-icon">GGUF</div>' +
-            '<div><div class="fname">qwen3-0.6b.gguf</div>' +
-            '<div class="fmeta">1.51 GB  -  header: magic=GGUF, version=3, n_tensors=291, n_kv=28</div></div>' +
-          '</div>' +
+            '<div><div class="fname">' + esc(MODEL.fileName) + badge + '</div>' +
+            '<div class="fmeta">' + fmtBytes(MODEL.fileSize) + '  -  header: magic=' + esc(MODEL.magic) +
+              ', version=' + MODEL.version + ', n_tensors=' + MODEL.nTensors + ', n_kv=' + MODEL.nKv + '</div>' +
+            (MODEL.headerBytes != null ? '<div class="fmeta">头部（kv 段 + tensor info 段）占用 ' + fmtBytes(MODEL.headerBytes) + '</div>' : '') +
+          '</div></div>' +
           '<div style="margin-top:16px" class="rowline">' +
-            node('magic', 'u32', 'input') + arrow() +
-            node('version', 'u32', 'input') + arrow() +
-            node('n_tensors', 'u64 = 291', 'input') + arrow() +
-            node('n_kv', 'u64 = 28', 'input') +
+            node('magic', esc(MODEL.magic), 'input') + arrow() +
+            node('version', 'u32 = ' + MODEL.version, 'input') + arrow() +
+            node('n_tensors', 'u64 = ' + MODEL.nTensors, 'input') + arrow() +
+            node('n_kv', 'u64 = ' + MODEL.nKv, 'input') +
           '</div>' +
-          '<p class="step-desc" style="margin-top:14px">文件头校验通过，准备读取元数据与张量表。</p>';
+          '<p class="step-desc" style="margin-top:14px">文件头校验通过，准备读取元数据与张量表。</p>' +
+          (isLoaded() ? '' : '<p class="step-desc">点击左侧【加载模型】按钮选择一个 .gguf 文件，即可用真实数据替换以上示例。</p>') +
+          renderGGUFLayout();
       }
     },
     {
       title: '解析元数据（超参数）',
-      desc: '从文件头之后读出 28 条 key-value 元数据。这些超参数决定了模型结构，也决定了后面计算图如何构建。',
-      concepts: [
-        ['架构', '<code>qwen3</code>：仅解码器（decoder-only）Transformer，用 GQA 注意力'],
-        ['GQA', '16 个 query 头共享 8 个 key/value 头，KV cache 更小'],
-        ['head_dim', '128：每个注意力头的维度，16 x 128 = 2048 为 Q 投影输出']
-      ],
-      logs: [
-        { cls: 'l-load', text: 'print_info: arch                  = qwen3' },
-        { cls: 'l-load', text: 'print_info: n_layer               = 28' },
-        { cls: 'l-load', text: 'print_info: n_embd                = 1024' },
-        { cls: 'l-load', text: 'print_info: n_head                = 16' },
-        { cls: 'l-load', text: 'print_info: n_head_kv             = 8' },
-        { cls: 'l-load', text: 'print_info: n_embd_head_k         = 128' },
-        { cls: 'l-load', text: 'print_info: n_ff                  = 3072' },
-        { cls: 'l-load', text: 'print_info: n_vocab               = 151936' },
-        { cls: 'l-load', text: 'print_info: rope_freq_base        = 1000000' }
-      ],
-      render: function (box) {
-        var rows = [
-          ['general.architecture', 'qwen3'],
-          ['general.name', 'Qwen3-0.6B'],
-          ['qwen3.context_length', MODEL.ctxLen],
-          ['qwen3.embedding_length', MODEL.hidden],
-          ['qwen3.block_count', MODEL.layers],
-          ['qwen3.feed_forward_length', MODEL.ffn],
-          ['qwen3.attention.head_count', MODEL.heads],
-          ['qwen3.attention.head_count_kv', MODEL.kvHeads],
-          ['qwen3.attention.key_length', MODEL.headDim],
-          ['qwen3.rope.freq_base', MODEL.ropeTheta],
-          ['qwen3.attention.layer_norm_rms_epsilon', '1e-06'],
-          ['tokenizer.ggml.model', 'gpt2 (BPE)'],
-          ['tokenizer.ggml.tokens', MODEL.vocab]
+      desc: '从文件头之后读出 key-value 元数据。这些超参数决定了模型结构，也决定了后面计算图如何构建。',
+      concepts: function () {
+        return [
+          ['架构', '<code>' + esc(MODEL.arch) + '</code>：仅解码器（decoder-only）Transformer，用 GQA 注意力'],
+          ['GQA', MODEL.heads + ' 个 query 头共享 ' + MODEL.kvHeads + ' 个 key/value 头，KV cache 更小'],
+          ['head_dim', MODEL.headDim + '：每个注意力头的维度，' + MODEL.heads + ' x ' + MODEL.headDim + ' = ' + (MODEL.heads * MODEL.headDim) + ' 为 Q 投影输出']
         ];
-        box.innerHTML = '<table class="kv-table">' + rows.map(function (r) {
-          return '<tr><td>' + esc(r[0]) + '</td><td>' + esc(r[1]) + '</td></tr>';
-        }).join('') + '</table>';
+      },
+      logs: function () {
+        return [
+          { cls: 'l-load', text: 'print_info: arch                  = ' + MODEL.arch },
+          { cls: 'l-load', text: 'print_info: n_layer               = ' + MODEL.layers },
+          { cls: 'l-load', text: 'print_info: n_embd                = ' + MODEL.hidden },
+          { cls: 'l-load', text: 'print_info: n_head                = ' + MODEL.heads },
+          { cls: 'l-load', text: 'print_info: n_head_kv             = ' + MODEL.kvHeads },
+          { cls: 'l-load', text: 'print_info: n_embd_head_k         = ' + MODEL.headDim },
+          { cls: 'l-load', text: 'print_info: n_ff                  = ' + MODEL.ffn },
+          { cls: 'l-load', text: 'print_info: n_vocab               = ' + MODEL.vocab },
+          { cls: 'l-load', text: 'print_info: rope_freq_base        = ' + MODEL.ropeTheta }
+        ];
+      },
+      render: function (box) {
+        if (isLoaded()) {
+          var rows = MODEL.meta.map(function (m, i) {
+            return '<tr><td class="idx">' + (i + 1) + '</td>' +
+                   '<td class="key">' + esc(m.key) + '</td>' +
+                   '<td class="desc">' + esc(metaDesc(m.key)) + '</td>' +
+                   '<td class="typ">' + esc(m.type) + '</td>' +
+                   '<td class="val">' + esc(fmtMetaValue(m.value)) + '</td></tr>';
+          }).join('');
+          box.innerHTML =
+            '<div style="font-family:var(--mono);font-size:11.5px;color:var(--text-dim);margin-bottom:8px">来自所选文件的 ' +
+              MODEL.nKv + ' 条元数据 <span style="color:var(--green)">实测</span></div>' +
+            '<table class="insp-table"><tbody>' + rows + '</tbody></table>';
+        } else {
+          var rows2 = [
+            ['general.architecture', MODEL.arch],
+            ['general.name', MODEL.name],
+            [MODEL.arch + '.context_length', MODEL.ctxLen],
+            [MODEL.arch + '.embedding_length', MODEL.hidden],
+            [MODEL.arch + '.block_count', MODEL.layers],
+            [MODEL.arch + '.feed_forward_length', MODEL.ffn],
+            [MODEL.arch + '.attention.head_count', MODEL.heads],
+            [MODEL.arch + '.attention.head_count_kv', MODEL.kvHeads],
+            [MODEL.arch + '.attention.key_length', MODEL.headDim],
+            [MODEL.arch + '.rope.freq_base', MODEL.ropeTheta],
+            [MODEL.arch + '.attention.layer_norm_rms_epsilon', '1e-06'],
+            ['tokenizer.ggml.model', 'gpt2 (BPE)'],
+            ['tokenizer.ggml.tokens', MODEL.vocab]
+          ];
+          box.innerHTML = '<table class="insp-table">' + rows2.map(function (r, i) {
+            return '<tr><td class="idx">' + (i + 1) + '</td>' +
+                   '<td class="key">' + esc(r[0]) + '</td>' +
+                   '<td class="desc">' + esc(metaDesc(r[0])) + '</td>' +
+                   '<td class="val">' + esc(r[1]) + '</td></tr>';
+          }).join('') + '</table>' +
+          '<p class="step-desc" style="margin-top:14px">当前为示例数据 <span style="color:var(--yellow)">示例</span>；' +
+          '点击左侧【加载模型】后，此处将展示所选文件的完整元数据 <span style="color:var(--green)">实测</span>。</p>';
+        }
       }
     },
     {
       title: '创建后端并上传权重',
-      desc: '根据 -ngl 参数创建后端（CPU / Metal GPU），把 291 个张量分配到各后端缓冲，并把权重数据从磁盘读入设备内存。',
-      concepts: [
-        ['后端(backend)', '执行计算的目标设备：CPU、Metal、CUDA、Vulkan 等'],
-        ['-ngl 99', '把全部 28 层放到 GPU；-ngl 0 则全部在 CPU'],
-        ['权重张量', 'token_embd、每层的 attn_q/k/v/o、mlp_gate/up/down 等']
-      ],
-      logs: [
-        { cls: 'l-load', text: 'llama_model_load: load_all_data: buffer size = 1503.02 MiB' },
-        { cls: 'l-load', text: 'llama_model_load: model size    = 1400.00 MiB' },
-        { cls: 'l-load', text: 'load_tensors: offloading 28 repeating layers to GPU' },
-        { cls: 'l-load', text: 'load_tensors: offloaded 29/29 layers to GPU' },
-        { cls: 'l-load', text: 'llama_model_load: Metal model buffer size = 1400.00 MiB' }
-      ],
-      render: function (box) {
-        var tensors = [
-          ['token_embd.weight', '[151936, 1024]', 'weight'],
-          ['blk.0.attn_norm.weight', '[1024]', 'norm'],
-          ['blk.0.attn_q.weight', '[2048, 1024]', 'attn'],
-          ['blk.0.attn_k.weight', '[1024, 1024]', 'attn'],
-          ['blk.0.attn_v.weight', '[1024, 1024]', 'attn'],
-          ['blk.0.ffn_gate.weight', '[3072, 1024]', 'mlp'],
-          ['...  (第 1..27 层同构)  ...', '', ''],
-          ['output_norm.weight', '[1024]', 'norm'],
-          ['output.weight', '(tied, 复用 token_embd)', 'out']
+      desc: '根据 -ngl 参数创建后端（CPU / Metal GPU），把模型的全部张量分配到各后端缓冲，并把权重数据从磁盘读入设备内存。',
+      concepts: function () {
+        return [
+          ['后端(backend)', '执行计算的目标设备：CPU、Metal、CUDA、Vulkan 等'],
+          ['-ngl 99', '把全部 ' + MODEL.layers + ' 层放到 GPU；-ngl 0 则全部在 CPU'],
+          ['权重张量', 'token_embd、每层的 attn_q/k/v/o、ffn_gate/up/down 等']
         ];
+      },
+      logs: function () {
+        return [
+          { cls: 'l-load', text: 'llama_model_load: model size    = ' + fmtBytes(MODEL.fileSize) },
+          { cls: 'l-load', text: 'load_tensors: offloading ' + MODEL.layers + ' repeating layers to GPU' },
+          { cls: 'l-load', text: 'load_tensors: offloaded ' + (MODEL.layers + 1) + '/' + (MODEL.layers + 1) + ' layers to GPU' },
+          { cls: 'l-load', text: 'llama_model_load: model buffer size = ' + fmtBytes(MODEL.fileSize) }
+        ];
+      },
+      render: function (box) {
+        var list;
+        if (isLoaded()) {
+          list = MODEL.tensors.slice(0, 12).map(function (t) {
+            return [t.name, '[' + t.dims.join(', ') + '] ' + t.type, tensorCls(t.name)];
+          });
+          if (MODEL.nTensors > 12) list.push(['... 共 ' + MODEL.nTensors + ' 个张量 ...', '', '']);
+        } else {
+          list = [
+            ['token_embd.weight', '[' + MODEL.vocab + ', ' + MODEL.hidden + ']', 'weight'],
+            ['blk.0.attn_norm.weight', '[' + MODEL.hidden + ']', 'norm'],
+            ['blk.0.attn_q.weight', '[' + (MODEL.heads * MODEL.headDim) + ', ' + MODEL.hidden + ']', 'attn'],
+            ['blk.0.attn_k.weight', '[' + (MODEL.kvHeads * MODEL.headDim) + ', ' + MODEL.hidden + ']', 'attn'],
+            ['blk.0.attn_v.weight', '[' + (MODEL.kvHeads * MODEL.headDim) + ', ' + MODEL.hidden + ']', 'attn'],
+            ['blk.0.ffn_gate.weight', '[' + MODEL.ffn + ', ' + MODEL.hidden + ']', 'mlp'],
+            ['...  (第 1..' + (MODEL.layers - 1) + ' 层同构)  ...', '', ''],
+            ['output_norm.weight', '[' + MODEL.hidden + ']', 'norm'],
+            ['output.weight', '(tied, 复用 token_embd)', 'out']
+          ];
+        }
         box.innerHTML =
           '<div class="rowline" style="margin-bottom:14px">' +
             node('CPU', 'backend', 'input') + arrow() +
             node('Metal / GPU', 'backend', 'attn') +
           '</div>' +
-          '<div class="layer-stack">' + tensors.map(function (t) {
+          '<div class="layer-stack">' + list.map(function (t) {
             if (!t[1]) return '<div class="layer-fold">' + esc(t[0]) + '</div>';
             return '<div class="rowline">' + node(t[0], '', t[2]) +
                    '<span class="arrow" style="margin-left:auto">' + esc(t[1]) + '</span></div>';
-          }).join('') + '</div>';
+          }).join('') + '</div>' +
+          (isLoaded()
+            ? '<p class="step-desc" style="margin-top:14px">张量列表取自所选文件 <span style="color:var(--green)">实测</span>（仅展示前 12 个）。</p>'
+            : '');
       }
     },
     {
       title: '创建 llama_context（分配 KV cache）',
       desc: '上下文（llama_context）持有推理所需的运行时状态：KV cache、输出缓冲、后端调度器。其中 KV cache 用来缓存历史 token 的 K/V，避免重复计算。',
-      concepts: [
-        ['KV cache', '缓存每层每步的 Key/Value 张量，是自回归生成的关键'],
-        ['GQA 的好处', '只需 8 个 KV 头而非 16 个，KV cache 减半'],
-        ['后端调度器', '<code>ggml_backend_sched</code>：把计算图切分到多个后端执行']
-      ],
-      logs: [
-        { cls: 'l-load', text: 'llama_context: n_ctx         = ' + KV_DEMO_CTX },
-        { cls: 'l-load', text: 'llama_context: n_batch       = 2048' },
-        { cls: 'l-load', text: 'llama_context: flash_attn    = auto' },
-        { cls: 'l-load', text: 'llama_kv_cache:      Metal buffer size = ' + kvMiB + ' MiB' },
-        { cls: 'l-load', text: 'sched_reserve: reserving ... graph nodes = 2240' }
-      ],
+      concepts: function () {
+        return [
+          ['KV cache', '缓存每层每步的 Key/Value 张量，是自回归生成的关键'],
+          ['GQA 的好处', '只需 ' + MODEL.kvHeads + ' 个 KV 头而非 ' + MODEL.heads + ' 个，KV cache 更小'],
+          ['后端调度器', '<code>ggml_backend_sched</code>：把计算图切分到多个后端执行']
+        ];
+      },
+      logs: function () {
+        return [
+          { cls: 'l-load', text: 'llama_context: n_ctx         = ' + KV_DEMO_CTX },
+          { cls: 'l-load', text: 'llama_context: n_batch       = 2048' },
+          { cls: 'l-load', text: 'llama_context: flash_attn    = auto' },
+          { cls: 'l-load', text: 'llama_kv_cache: buffer size  = ' + kvMiB() + ' MiB' },
+          { cls: 'l-load', text: 'sched_reserve: reserving ... graph nodes' }
+        ];
+      },
       render: function (box) {
         box.innerHTML =
           '<div class="concept-card" style="font-family:var(--mono)">' +
             'KV = n_ctx(' + KV_DEMO_CTX + ') x n_layer(' + MODEL.layers + ') x n_kv_heads(' + MODEL.kvHeads +
-            ') x head_dim(' + MODEL.headDim + ') x 2(K,V) x 2B = <b>' + kvMiB + ' MiB</b>' +
+            ') x head_dim(' + MODEL.headDim + ') x 2(K,V) x 2B = <b>' + kvMiB() + ' MiB</b>' +
           '</div>' +
           '<div class="mem-bar" style="margin-top:14px">' +
-            '<div class="mem-seg w"  style="flex:60">weights ~1400 MiB</div>' +
-            '<div class="mem-seg kv" style="flex:20">KV cache ' + kvMiB + ' MiB</div>' +
+            '<div class="mem-seg w"  style="flex:60">weights ' + fmtBytes(MODEL.fileSize) + '</div>' +
+            '<div class="mem-seg kv" style="flex:20">KV cache ' + kvMiB() + ' MiB</div>' +
             '<div class="mem-seg out" style="flex:12">output / compute</div>' +
           '</div>' +
           '<div class="rowline" style="margin-top:16px">' +
@@ -202,7 +542,9 @@
             node('llama_context', '运行时状态', 'input') + arrow() +
             node('llama_sampler', '采样器链', 'out') +
           '</div>' +
-          '<p class="step-desc" style="margin-top:14px">模型加载完成，可以开始推理。</p>';
+          '<p class="step-desc" style="margin-top:14px">模型加载完成，可以开始推理。</p>' +
+          '<p class="step-desc">KV cache 依模型结构参数估算 <span style="color:var(--cyan)">计算值</span>；n_ctx=' +
+            KV_DEMO_CTX + ' 为演示假设，非模型文件携带的信息。</p>';
       }
     }
   ];
@@ -659,11 +1001,48 @@
       document.getElementById('btn-prev').addEventListener('click', function () { self.prev(); });
       document.getElementById('btn-play').addEventListener('click', function () { self.togglePlay(); });
       document.getElementById('btn-reset').addEventListener('click', function () { self.reset(); });
+      var mf = document.getElementById('model-file');
+      if (mf) mf.addEventListener('change', function (e) {
+        var f = e.target.files && e.target.files[0];
+        if (f) self.loadModelFile(f);
+      });
       window.addEventListener('keydown', function (e) {
         if (e.key === 'ArrowRight') self.next();
         if (e.key === 'ArrowLeft') self.prev();
       });
       this.render();
+    },
+
+    // 打开系统文件选择框（由左侧“加载模型”按钮触发）
+    openModelPicker: function () {
+      var mf = document.getElementById('model-file');
+      if (mf) mf.click();
+    },
+
+    // 读取并解析所选 GGUF；成功后更新数据源并重置到第一步
+    loadModelFile: function (file) {
+      var self = this;
+      var MAX_HEAD = 32 * 1024 * 1024;
+      var fr = new FileReader();
+      fr.onload = function () {
+        try {
+          var info = window.parseGGUF(fr.result);
+          setModelFromGGUF(info, file);
+          self.stopPlay();
+          self.stage = 0;
+          self.step = 0;
+          self.render();
+        } catch (err) {
+          var msg = '解析 GGUF 失败：' + (err && err.message ? err.message : err);
+          if (typeof alert === 'function') alert(msg); else console.error(msg);
+        }
+      };
+      fr.onerror = function () {
+        if (typeof alert === 'function') alert('读取文件失败');
+      };
+      fr.readAsArrayBuffer(file.slice(0, Math.min(file.size, MAX_HEAD)));
+      var mf = document.getElementById('model-file');
+      if (mf) mf.value = ''; // 允许重复选择同一文件
     },
 
     totalSteps: function () {
@@ -753,10 +1132,35 @@
       document.getElementById('stage-sub').textContent = stage.sub;
       document.getElementById('step-title').textContent = step.title;
       document.getElementById('step-desc').innerHTML = step.desc;
-      document.getElementById('steps').innerHTML = stage.steps.map(function (st, i) {
+      var stepsEl = document.getElementById('steps');
+      stepsEl.innerHTML = stage.steps.map(function (st, i) {
         var cls = i === App.step ? 'active' : (i < App.step ? 'done' : '');
-        return '<li class="' + cls + '">' + (i + 1) + '. ' + esc(st.title) + '</li>';
+        return '<li class="' + cls + '" data-i="' + i + '">' + (i + 1) + '. ' + esc(st.title) + '</li>';
       }).join('');
+      // 点击步骤项直接跳到该步（本阶段内），并停止自动播放
+      Array.prototype.forEach.call(stepsEl.querySelectorAll('li'), function (li) {
+        li.addEventListener('click', function () {
+          var target = parseInt(li.dataset.i, 10);
+          if (target === App.step) return;
+          App.stopPlay();
+          App.step = target;
+          App.render();
+        });
+      });
+
+      // “加载模型”入口：仅出现在“模型加载”阶段，位于步骤列表之后，不计入步骤数
+      var slot = document.getElementById('load-model-slot');
+      if (slot) {
+        if (stage.id === 'load') {
+          slot.innerHTML = '<button class="btn load-model-btn" id="btn-load-model">' +
+            (isLoaded() ? '重新加载模型 (.gguf)' : '加载模型 (.gguf)') + '</button>';
+          var lb = slot.querySelector('#btn-load-model');
+          if (lb) lb.addEventListener('click', function () { App.openModelPicker(); });
+        } else {
+          slot.innerHTML = '';
+        }
+      }
+
       document.getElementById('concepts').innerHTML = concepts(step.concepts);
 
       // 中间舞台
@@ -767,13 +1171,38 @@
       viz.innerHTML = '';
       step.render(viz);
 
-      // 右侧日志：累积当前阶段到当前 step 的所有日志
+      // 右侧日志：累积当前阶段到当前 step 的所有日志（logs 可为数组或函数）
       var logs = [];
       for (var i = 0; i <= this.step; i++) {
-        logs = logs.concat(stage.steps[i].logs || []);
+        var ls = stage.steps[i].logs;
+        logs = logs.concat(typeof ls === 'function' ? ls() : (ls || []));
       }
       logs.push({ cls: 'l-hl', text: '--- 步骤 ' + (this.step + 1) + ': ' + step.title + ' ---' });
       Log.setStageLogs(logs);
+
+      // 右侧参数表：跟随 MODEL 单一数据源
+      document.getElementById('params').innerHTML = [
+        ['arch', MODEL.arch],
+        ['n_layer', MODEL.layers],
+        ['n_embd', MODEL.hidden],
+        ['n_head / n_head_kv', MODEL.heads + ' / ' + MODEL.kvHeads],
+        ['head_dim', MODEL.headDim],
+        ['n_ff', MODEL.ffn],
+        ['n_vocab', MODEL.vocab],
+        ['rope_theta', MODEL.ropeTheta],
+        ['ctx_length', MODEL.ctxLen],
+        ['file_type', MODEL.fileType]
+      ].map(function (r) {
+        return '<div class="p"><span>' + esc(r[0]) + '</span><span>' + esc(r[1]) + '</span></div>';
+      }).join('');
+
+      // 顶部模型徽章
+      var badge = document.getElementById('model-badge');
+      if (badge) {
+        badge.innerHTML = '<span class="dot"></span>' + esc(MODEL.name) + ' · ' + MODEL.layers + ' 层 · GQA ' +
+          MODEL.heads + '/' + MODEL.kvHeads +
+          (isLoaded() ? ' · <span style="color:var(--green)">已加载</span>' : '');
+      }
 
       // 底部进度
       document.getElementById('progress').style.width =
