@@ -58,7 +58,18 @@
 <!-- 隐藏的模型文件选择框，由左侧“加载模型”按钮触发 -->
 <input type="file" id="model-file" accept=".gguf" style="display:none">
 
+<script>
+window.MathJax = {
+  tex: {
+    inlineMath: [['$', '$'], ['\\(', '\\)']],
+    displayMath: [['$$', '$$'], ['\\[', '\\]']]
+  },
+  svg: { fontCache: 'global' }
+};
+</script>
+<script src="mathjax/tex-svg.js" id="MathJax-script" async></script>
 <script src="gguf.js"></script>
+<script src="tokenizer.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

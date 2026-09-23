@@ -335,6 +335,261 @@ main {
 .layer-body { margin-top: 10px; display: none; flex-direction: column; gap: 8px; }
 .layer-block.open .layer-body { display: flex; }
 
+/* ---------- 单层垂直流程（含残差旁路） ---------- */
+.lflow {
+  position: relative;
+  padding-left: 44px;
+  padding-bottom: 2px;
+}
+.lstep {
+  height: 30px;
+  display: grid;
+  /* 第 1 列留空 186px，节点固定在第 2 列（172px）→ 节点中心恒为 272px，与 K proj 对齐 */
+  grid-template-columns: 186px 172px minmax(140px, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+}
+.lstep .lstep-node { grid-column: 2; }
+.lstep .lstep-op   { grid-column: 3; }
+.lstep .lstep-dim  { grid-column: 4; }
+
+/* 相邻步骤之间的连线：圆点（起）→ 竖线 → 箭头（止），居中于算子列正下方 */
+.lconn {
+  position: relative;
+  height: 18px;
+  width: 544px; /* 圆点落在 272px，与节点列同轴 */
+}
+.lconn::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 0;
+  transform: translateX(-50%);
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--cyan);
+}
+.lconn::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 5px;
+  bottom: 6px;
+  transform: translateX(-50%);
+  width: 1.5px;
+  background: var(--cyan);
+}
+.lconn i {
+  position: absolute;
+  left: 50%;
+  bottom: 0;
+  transform: translateX(-50%);
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 6px solid var(--cyan);
+}
+
+/* 三路并发分叉（直角 SVG） */
+.lstep-fork { position: relative; height: 72px; }
+.lfork-svg { display: block; width: 544px; height: 72px; overflow: visible; }
+.lfork-line { fill: none; stroke: var(--cyan); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.lfork-dot  { fill: var(--cyan); }
+.lfork-head { fill: var(--cyan); }
+
+/* 三列并发行（Q / K / V 并发）：每列是一条垂直链，内容顶部对齐 */
+.lstep-tri {
+  height: 160px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+}
+/* 三列撑满本行高度，使列底边恒等于行底边（圆点上方的补线才能无缝接上） */
+.ltri-cols { display: flex; justify-content: flex-start; gap: 14px; align-items: stretch; height: 100%; }
+/* 列容器：只用虚线表示"列的分组边界"，模块各自成框 */
+.ltri-col {
+  width: 172px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  background: rgba(255,255,255,.012);
+}
+/* 模块框：Q proj / RoPE 等各自独立的实线框 */
+.ltri-box {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  background: var(--bg-elev2);
+}
+.ltri-name { font-family: var(--mono); font-size: 11.5px; font-weight: 600; color: var(--text); }
+.ltri-name.attn  { color: var(--purple); }
+.ltri-name.mlp   { color: var(--cyan); }
+.ltri-name.cache { color: var(--red); }
+.ltri-name.norm  { color: var(--pink); }
+.ltri-name.input { color: var(--blue); }
+.ltri-name.resid { color: var(--green); }
+.ltri-op  { font-family: var(--mono); font-size: 10.5px; color: var(--text-faint); }
+.ltri-dim { font-family: var(--mono); font-size: 11px; color: var(--cyan); }
+.ltri-tag { font-family: var(--mono); font-size: 10px; color: var(--text-faint); text-align: center; }
+
+/* 列内部：圆点 → 竖线 → 箭头（连接列内两个模块） */
+.ltri-conn {
+  position: relative;
+  width: 100%;
+  height: 18px;
+}
+.ltri-conn::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 0;
+  transform: translateX(-50%);
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--cyan);
+}
+.ltri-conn::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 5px;
+  bottom: 6px;
+  transform: translateX(-50%);
+  width: 1.5px;
+  background: var(--cyan);
+}
+.ltri-conn i {
+  position: absolute;
+  left: 50%;
+  bottom: 0;
+  transform: translateX(-50%);
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 6px solid var(--cyan);
+}
+.lstep-node {
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-elev2);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.lstep-node.input { border-color: rgba(88,166,255,.5);  color: var(--blue); }
+.lstep-node.norm  { border-color: rgba(247,120,186,.5); color: var(--pink); }
+.lstep-node.attn  { border-color: rgba(188,140,255,.5); color: var(--purple); }
+.lstep-node.cache { border-color: rgba(248,81,73,.5);   color: var(--red); }
+.lstep-node.mlp   { border-color: rgba(57,197,207,.5);  color: var(--cyan); }
+.lstep-node.resid {
+  border-color: var(--green);
+  color: var(--green);
+  background: rgba(63,185,80,.12);
+  font-weight: 600;
+}
+.lstep-op  { font-family: var(--mono); font-size: 10.5px; color: var(--text-faint); }
+.lstep-dim { font-family: var(--mono); font-size: 11px;  color: var(--cyan); white-space: nowrap; }
+
+/* 残差旁路：纯 CSS 折线（L 形，左下圆角） */
+.lpath {
+  position: absolute;
+  left: 12px;
+  width: 26px;
+  border-left: 1.5px solid var(--green);
+  border-bottom: 1.5px solid var(--green);
+  border-bottom-left-radius: 8px;
+  pointer-events: none;
+}
+
+/* 可点击的算子 */
+.lstep-node.clickable { cursor: pointer; }
+.lstep-node.clickable:hover {
+  border-color: var(--yellow);
+  color: var(--yellow);
+  box-shadow: 0 0 0 2px rgba(210,153,34,.18);
+}
+
+/* 算子详情面板（数学过程） */
+.ldetail {
+  margin-top: 14px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--yellow);
+  border-radius: 8px;
+  background: var(--bg);
+  overflow: hidden;
+}
+.ldetail-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--yellow);
+}
+.ldetail-hint { color: var(--text-faint); font-size: 10.5px; }
+.ldetail-src {
+  display: inline-block;
+  margin-right: 4px;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+.ldetail-body { padding: 10px 16px 16px; max-width: 780px; }
+.ldetail-body h4 {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--text);
+  margin: 16px 0 6px;
+}
+.ldetail-p { font-size: 12.5px; line-height: 1.75; color: #a8b1bb; margin: 6px 0; }
+.ldetail-p code {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--cyan);
+  background: var(--bg-elev2);
+  padding: 1px 4px;
+  border-radius: 4px;
+}
+.ldetail-ul { margin: 6px 0; padding-left: 20px; }
+.ldetail-ul li { font-size: 12.5px; line-height: 1.75; color: #a8b1bb; }
+.ldetail-table { width: 100%; border-collapse: collapse; margin: 8px 0; }
+.ldetail-table th, .ldetail-table td {
+  border: 1px solid var(--border);
+  padding: 5px 10px;
+  text-align: left;
+  font-size: 11.5px;
+  color: #a8b1bb;
+}
+.ldetail-table th { background: var(--bg-elev); color: var(--text-dim); font-weight: 600; }
+
+/* MathJax 渲染结果跟随页面配色 */
+.ldetail mjx-container { color: #c9d1d9 !important; }
+.ldetail mjx-container[display="true"] { margin: 12px 0 !important; overflow-x: auto; overflow-y: hidden; }
+
 .layer-fold {
   text-align: center;
   color: var(--text-faint);
@@ -434,6 +689,22 @@ main {
   min-height: 56px;
   line-height: 1.7;
 }
+
+.text-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 14px;
+  padding: 7px 10px;
+  outline: none;
+  transition: border-color .16s ease;
+}
+.text-input:focus { border-color: var(--blue); }
+.text-input::placeholder { color: var(--text-faint); }
 
 .output-box .prompt { color: var(--text-faint); }
 .output-box .gen { color: var(--green); }
@@ -541,6 +812,7 @@ footer {
 
 /* ---------- 模型信息表格（阶段1：元数据 / 张量） ---------- */
 .insp-table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 11.5px; }
+.insp-table th { padding: 4px 10px; text-align: left; color: var(--text-faint); font-weight: 600; border-bottom: 1px solid var(--border); }
 .insp-table td { padding: 3px 10px; border-bottom: 1px solid rgba(45,51,59,.5); vertical-align: top; }
 .insp-table td.idx  { width: 3em; text-align: right; color: var(--text-faint); white-space: nowrap; }
 .insp-table td.key  { color: var(--text); }
@@ -649,6 +921,138 @@ footer {
 @media (max-width: 900px) {
   .gguf-fields, .gguf-fields.cols3, .gguf-fields.cols5 { grid-template-columns: repeat(2, 1fr); }
 }
+
+/* ---------- inp_tokens 数据流图（左侧曲线串联） ---------- */
+.flow {
+  position: relative;
+  margin-top: 16px;
+  padding-left: 104px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.flow-station { position: relative; }
+.flow-ids { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.flow-meta { font-family: var(--mono); font-size: 11px; color: var(--text-faint); }
+
+.flow-svg {
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+  overflow: visible;
+}
+.flow-svg .flow-curve { fill: none; stroke: var(--cyan); stroke-width: 1.5; }
+.flow-svg .flow-dot   { fill: var(--cyan); }
+.flow-svg .flow-head  { fill: var(--cyan); }
+
+.flow-label {
+  position: absolute;
+  left: 4px;
+  transform: translateY(-50%);
+  max-width: 88px;
+  background: var(--bg);
+  border: 1px solid rgba(57,197,207,.4);
+  border-radius: 6px;
+  padding: 2px 6px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.3;
+  color: var(--cyan);
+}
+
+.inp-box {
+  border: 1px solid rgba(57,197,207,.55);
+  border-left-width: 3px;
+  border-radius: 6px;
+  background: var(--bg-elev);
+  padding: 8px 12px;
+  max-width: 460px;
+}
+.inp-box-title { font-family: var(--mono); font-weight: 600; color: var(--cyan); margin-bottom: 4px; }
+.inp-box-row { display: flex; gap: 10px; font-family: var(--mono); font-size: 11px; margin-top: 2px; }
+.inp-box-row span:first-child { color: var(--text-faint); width: 3em; flex: 0 0 auto; }
+.inp-box-row span:last-child { color: var(--text); }
+
+/* ---------- token_id -> embedding 查表可视化 ---------- */
+.emb-wrap { max-width: 660px; }
+.emb-title { font-family: var(--mono); font-size: 11.5px; color: var(--text-dim); margin-bottom: 8px; }
+
+.emb-flow { display: flex; align-items: flex-start; gap: 6px; }
+
+.emb-col { display: flex; flex-direction: column; }
+.emb-col.arr { color: var(--cyan); }
+
+.emb-id-row, .emb-arrow, .emb-row { height: 26px; display: flex; align-items: center; }
+.emb-id-row { gap: 8px; white-space: nowrap; }
+.emb-arrow { font-family: var(--mono); font-size: 11px; }
+.emb-more { height: 26px; display: flex; align-items: center; font-family: var(--mono); font-size: 10.5px; color: var(--text-faint); }
+
+.emb-id {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--cyan);
+  min-width: 3.8em;
+  text-align: right;
+}
+.emb-piece { font-family: var(--mono); font-size: 11px; color: #a8b1bb; }
+
+.emb-matrix {
+  position: relative;
+  flex: 1;
+  min-width: 250px;
+  border: 1px solid rgba(57,197,207,.55);
+  border-radius: 6px;
+  padding: 6px 10px 28px;
+  background: var(--bg-elev);
+}
+.emb-row { gap: 10px; }
+.emb-row-id { font-family: var(--mono); font-size: 11px; color: var(--cyan); min-width: 7em; }
+.emb-vec { font-family: var(--mono); font-size: 11px; color: var(--cyan); letter-spacing: 1px; }
+.emb-ellip { font-family: var(--mono); font-size: 10.5px; color: var(--text-faint); padding: 4px 0 2px; }
+.emb-shape {
+  position: absolute;
+  right: 8px;
+  bottom: 6px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--yellow);
+}
+
+.emb-note { font-family: var(--mono); font-size: 10.5px; line-height: 1.6; color: var(--text-faint); margin-top: 8px; }
+
+/* ---------- 代码实现图 ---------- */
+.code-wrap { margin-top: 20px; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.code-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+.code-head code { color: var(--cyan); }
+.code-link { color: var(--blue); text-decoration: none; }
+.code-link:hover { text-decoration: underline; }
+.code-body {
+  margin: 0;
+  padding: 12px;
+  background: var(--bg);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: #a8b1bb;
+  overflow-x: auto;
+  white-space: pre;
+}
+.code-body .c-num { color: var(--text-faint); }
+.code-body .c-fn  { color: var(--purple); }
+.code-body .c-cm  { color: var(--text-faint); }
 
 @media (max-width: 1100px) {
   main { grid-template-columns: 1fr; }

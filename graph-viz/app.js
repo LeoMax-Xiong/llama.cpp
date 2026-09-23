@@ -37,6 +37,13 @@
 
   function isLoaded() { return MODEL.source === 'loaded'; }
 
+  // 全局输入文本（用户在“准备输入张量”中输入，后续步骤共用）
+  var INPUT_TEXT = '你是谁';
+  var TOKENIZER = null; // 加载模型后构建（需要真实词表）
+
+  // 当前展开详情的算子：{ layer: 层号, op: 算子名 } 或 null
+  var LAYER_DETAIL = null;
+
   // KV cache 大小：n_ctx（演示假设值）* n_layer * n_kv_heads * head_dim * 2(K,V) * 2字节(f16)
   var KV_DEMO_CTX = 4096;
   function kvMiB() {
@@ -131,6 +138,323 @@
     if (ft != null) MODEL.fileType = FILE_TYPE[ft] || ('TYPE_' + ft);
     var nm = metaGet(m, 'general.name');
     MODEL.name = nm ? String(nm).trim() : file.name;
+  }
+
+  // 用模型的词表/合并表构建分词器
+  function buildTokenizer(info) {
+    TOKENIZER = null;
+    if (!window.GGUFTokenizer) return;
+    var t = metaGet(info.metadata, 'tokenizer.ggml.tokens');
+    var mg = metaGet(info.metadata, 'tokenizer.ggml.merges');
+    var full = function (x) { return x && x.__array && x.full && x.sample; };
+    if (full(t) && full(mg)) {
+      try {
+        TOKENIZER = new window.GGUFTokenizer(t.sample, mg.sample);
+      } catch (e) {
+        TOKENIZER = null;
+      }
+    }
+  }
+
+  // ------------------------------------------------ 输入文本分词（真实 BPE）
+  function tokenizeInfo() {
+    if (!TOKENIZER) return { ok: false, reason: 'nolm' };
+    try {
+      var toks = TOKENIZER.encode(INPUT_TEXT);
+      return {
+        ok: true,
+        toks: toks,
+        chars: INPUT_TEXT.length,
+        bytes: new TextEncoder().encode(INPUT_TEXT).length
+      };
+    } catch (e) {
+      return { ok: false, reason: 'err', err: e.message };
+    }
+  }
+  // 当前输入的 token 数（无分词器时回退示例值 3）
+  function tokenCount() {
+    var info = tokenizeInfo();
+    return info.ok ? info.toks.length : 3;
+  }
+  function tokenStatHTML(info) {
+    if (!info.ok) {
+      return '<p class="step-desc" style="margin:8px 0">' +
+        (info.reason === 'nolm' ? '请先加载模型（需要真实词表）以启用分词。'
+                                : '分词失败：' + esc(info.err || '')) + '</p>';
+    }
+    return '<div style="font-family:var(--mono);font-size:11.5px;color:var(--text-dim);margin:8px 0">' +
+      'token 数 ' + info.toks.length + ' · 字符数 ' + info.chars + ' · UTF-8 字节 ' + info.bytes + '</div>';
+  }
+  function tokenTableHTML(toks) {
+    if (!toks || !toks.length) return '<p class="step-desc">（空输入）</p>';
+    return '<table class="insp-table"><thead><tr>' +
+      '<th class="idx">#</th><th>token id</th><th>token 原文</th><th>对应原文片段</th>' +
+      '</tr></thead><tbody>' + toks.map(function (t, i) {
+        return '<tr><td class="idx">' + (i + 1) + '</td>' +
+               '<td class="val">' + t.id + '</td>' +
+               '<td class="key">' + esc(t.token) + '</td>' +
+               '<td class="desc">' + esc(t.text) + '</td></tr>';
+      }).join('') + '</tbody></table>';
+  }
+  // ------------------------------------------------ 算子详情（数学过程）
+  function rmsEps() {
+    if (!MODEL.meta) return '1e-06';
+    var v = metaGet(MODEL.meta, MODEL.arch + '.attention.layer_norm_rms_epsilon');
+    return v != null ? String(v) : '1e-06';
+  }
+
+  // MathJax 排版（等其就绪后再排）
+  function typesetMath(el) {
+    var MJ = window.MathJax;
+    if (!MJ || !el) return;
+    var run = function () {
+      if (MJ.typesetPromise) MJ.typesetPromise([el]).catch(function () {});
+    };
+    if (MJ.startup && MJ.startup.promise) MJ.startup.promise.then(run).catch(function () {});
+    else run();
+  }
+
+  function layerDetailHTML(op, layer) {
+    if (op !== 'attn_norm') return '';
+    var d = MODEL.hidden;
+    var eps = rmsEps();
+    var n = tokenCount();
+    var src = (layer != null && layer >= 0) ? '<span class="ldetail-src">来自 blk.' + layer + '.</span> ' : '';
+    return '<div class="ldetail" id="layer-detail">' +
+      '<div class="ldetail-head">' +
+        '<span>' + src + 'attn_norm · RMSNorm（均方根归一化）</span>' +
+        '<span class="ldetail-hint">再点一次算子名可收起</span>' +
+      '</div>' +
+      '<div class="ldetail-body">' +
+        '<p class="ldetail-p"><b>作用</b>：进入注意力之前，把每个 token 的向量缩放到「单位均方」，稳定后续数值。</p>' +
+        '<p class="ldetail-p"><b>输入 / 输出</b>：$x \\in \\mathbb{R}^{n \\times d}$，其中 $n = ' + n +
+          '$（token 数）、$d = ' + d + '$（隐藏维）；输出形状不变。</p>' +
+
+        '<h4>① 平方均值（mean square）</h4>' +
+        '$$ \\mathrm{ms}(x) = \\frac{1}{d}\\sum_{i=1}^{d} x_i^2 $$' +
+        '<p class="ldetail-p">对这一个 token 的 $d = ' + d + '$ 个分量求平方后取平均。</p>' +
+
+        '<h4>② 均方根（root mean square）</h4>' +
+        '$$ \\mathrm{rms}(x) = \\sqrt{\\mathrm{ms}(x) + \\epsilon},\\qquad \\epsilon = 10^{-6} $$' +
+        '<p class="ldetail-p">$\\epsilon$ 是防止除以 0 的小量；取自模型元数据 <code>' + MODEL.arch +
+          '.attention.layer_norm_rms_epsilon</code> = ' + eps + '（即 $10^{-6}$）。</p>' +
+
+        '<h4>③ 归一化</h4>' +
+        '$$ \\hat{x}_i = \\frac{x_i}{\\mathrm{rms}(x)} $$' +
+
+        '<h4>③′ 归一化后的性质：均方 = 1（平方和 = d）</h4>' +
+        '<p class="ldetail-p">把 ③ 代入 ② 可得（忽略 $\\epsilon$）：</p>' +
+        '$$ \\sum_{i=1}^{d}\\hat{x}_i^2 = \\frac{\\sum_i x_i^2}{\\mathrm{rms}^2} \\approx d $$' +
+        '<p class="ldetail-p">也就是：<b>均方 = 1</b>、<b>RMS = 1</b>、L2 范数 $\\|\\hat{x}\\|_2 = \\sqrt{d}$。</p>' +
+        '<p class="ldetail-p">小例子（$d = 4$）：$x = [1,\\, 2,\\, 3,\\, 4]$ → $\\mathrm{ms} = 7.5$ → ' +
+          '$\\mathrm{rms} \\approx 2.739$ → $\\hat{x} \\approx [0.365,\\, 0.730,\\, 1.095,\\, 1.460]$ → 平方和 $\\approx 4 = d$。</p>' +
+        '<p class="ldetail-p">为什么归一化到「均方 = 1」而不是「平方和 = 1」？后者会让单个分量的平均大小 ' +
+          '$\\approx 1/\\sqrt{d}$，随维度变化；而均方 = 1 使<b>每个分量的量级与维度 $d$ 解耦</b>' +
+          '——无论隐藏维是 1024 还是 4096，输入尺度都稳定。</p>' +
+
+        '<h4>④ 逐元素缩放（可学习参数）</h4>' +
+        '$$ y_i = \\hat{x}_i \\cdot w_i $$' +
+        '<p class="ldetail-p">$w$ 是权重张量 <code>blk.N.attn_norm.weight</code>（$\\mathbb{R}^{' + d + '}$），逐元素相乘。</p>' +
+        '<p class="ldetail-p">注意：乘上 $w$ 之后，输出<b>不再</b>满足平方和 = $d$' +
+          '（$\\sum_i y_i^2 = \\sum_i \\hat{x}_i^2 w_i^2$）——归一化负责「定尺度」，$w$ 负责「按维度重新调整尺度与重要性」。</p>' +
+
+        '<h4>合并成一条公式</h4>' +
+        '$$ y = \\frac{x}{\\sqrt{\\frac{1}{d}\\sum_{i=1}^{d} x_i^2 + \\epsilon}} \\odot w $$' +
+
+        '<h4>与 LayerNorm 的区别</h4>' +
+        '<table class="ldetail-table"><thead><tr><th>项</th><th>LayerNorm</th><th>RMSNorm（本层）</th></tr></thead><tbody>' +
+        '<tr><td>是否减均值</td><td>是：$\\dfrac{x-\\mu}{\\sigma}$</td><td><b>否</b>：只除以 RMS</td></tr>' +
+        '<tr><td>中心化</td><td>需要（求 $\\mu$）</td><td>不需要</td></tr>' +
+        '<tr><td>计算量</td><td>较大（均值 + 方差）</td><td>较小（只求均方）</td></tr>' +
+        '<tr><td>可学习参数</td><td>缩放 $\\gamma$ + 偏置 $\\beta$</td><td>仅缩放 $w$</td></tr>' +
+        '</tbody></table>' +
+
+        '<h4>为什么这样设计</h4>' +
+        '<ul class="ldetail-ul">' +
+        '<li><b>尺度不变性</b>：若输入整体放大 $k$ 倍（$x \\to kx$），$\\mathrm{rms}$ 也放大 $k$ 倍，相除后 ' +
+          '$\\hat{x}$ 完全不变——结果只看「相对大小」，与输入的绝对量级无关。</li>' +
+        '<li><b>数值稳定</b>：无论上一层输出多大，送进 Q/K/V 投影的输入都被压回固定量级，避免 fp16/bf16 溢出或下溢。</li>' +
+        '<li><b>训练稳定</b>：防止激活值随层数加深而爆炸/消失，也让梯度不被大激活主导。</li>' +
+        '<li><b>参数更少、算得更快</b>：省掉均值与偏置（而「减均值」的收益本身就很小），大模型下收益可观。</li>' +
+        '<li><b>让 $w$ 的职责更纯粹</b>：归一化负责定尺度，$w$ 只需学习各维度的重要性与相对尺度。</li>' +
+        '</ul>' +
+
+        '<h4>在 llama.cpp 里的实现</h4>' +
+        '<p class="ldetail-p"><code>cur = ggml_rms_norm(ctx0, cur);</code><br>' +
+          '<code>cur = ggml_mul(ctx0, cur, layer.attn_norm);</code></p>' +
+
+        '<h4>参数量</h4>' +
+        '<p class="ldetail-p">每层仅 ' + d + ' 个可学习参数（$w$）；全模型 ' + MODEL.layers + ' 层共 ' +
+          (d * MODEL.layers).toLocaleString() + ' 个。</p>' +
+
+        '<h4>出处</h4>' +
+        '<p class="ldetail-p">Zhang &amp; Sennrich, 2019, "Root Mean Square Layer Normalization", arXiv:1910.07467。</p>' +
+      '</div>' +
+    '</div>';
+  }
+
+  // token_id -> embedding 的查表可视化
+  function embLookupHTML(info) {
+    var toks = (info && info.ok) ? info.toks : [];
+    var n = toks.length;
+    var show = Math.min(n, 6);
+    var VEC = '▮▮▮▮▮'; // 只用几个方块示意"这是一个向量"
+
+    var idsCol = '', arrCol = '', matCol = '';
+    for (var i = 0; i < show; i++) {
+      idsCol += '<div class="emb-id-row"><span class="emb-id">' + toks[i].id + '</span>' +
+                '<span class="emb-piece">' + esc(toks[i].text || '') + '</span></div>';
+      arrCol += '<div class="emb-arrow">──────▶</div>';
+      matCol += '<div class="emb-row"><span class="emb-row-id">行 ' + toks[i].id + '</span>' +
+                '<span class="emb-vec">' + VEC + '</span></div>';
+    }
+    if (n > show) {
+      idsCol += '<div class="emb-more">… 共 ' + n + ' 个 token</div>';
+      arrCol += '<div class="emb-more">&nbsp;</div>';
+      matCol += '<div class="emb-more">&nbsp;</div>';
+    }
+    matCol += '<div class="emb-ellip">⋮ 其余 ' + Math.max(0, MODEL.vocab - n) + ' 行未被取用</div>';
+
+    return '<div class="emb-wrap">' +
+      '<div class="emb-title">查表（gather）：按 token id 从权重矩阵里取出对应的行</div>' +
+      '<div class="emb-flow">' +
+        '<div class="emb-col">' + idsCol + '</div>' +
+        '<div class="emb-col arr">' + arrCol + '</div>' +
+        '<div class="emb-matrix">' + matCol +
+          '<div class="emb-shape">[' + MODEL.vocab + ', ' + MODEL.hidden + ']</div>' +
+        '</div>' +
+      '</div>' +
+      '<div class="emb-note">' +
+        'embeddings[i] = W[ token_id[i] ]　·　对应 ggml_get_rows（直接取行）<br>' +
+        '数学上等价于 one_hot(token_id) × W（' + MODEL.vocab + ' 维 one-hot，只有一位为 1）<br>' +
+        '另：源码里还有 inp_embd 入口 —— 多模态时可直接喂入嵌入向量，跳过查表' +
+      '</div>' +
+    '</div>';
+  }
+
+  function tokenNodesHTML(info) {
+    var n = info && info.ok ? info.toks.length : 0;
+    var ids = (info && info.ok) ? info.toks.map(function (t) { return t.id; }) : [];
+    var preview = INPUT_TEXT.length > 24 ? INPUT_TEXT.slice(0, 24) + '…' : INPUT_TEXT;
+    var idsStr;
+    if (!ids.length) idsStr = '[]';
+    else if (ids.length > 8) idsStr = '[' + ids.slice(0, 8).join(', ') + ', …]';
+    else idsStr = '[' + ids.join(', ') + ']';
+
+    // 图一：inp_tokens 数据流（4 个站点，左侧用曲线串联）
+    var flow =
+      '<div class="flow">' +
+        '<div class="flow-station"><div class="rowline">' + node('"' + preview + '"', 'text', 'input') + '</div></div>' +
+        '<div class="flow-station"><div class="flow-ids">' + node(idsStr, 'token ids', 'input') +
+          '<span class="flow-meta">n_tokens = ' + n + '</span></div></div>' +
+        '<div class="flow-station"><div class="inp-box">' +
+          '<div class="inp-box-title">inp_tokens</div>' +
+          '<div class="inp-box-row"><span>类型</span><span>I32（32 位整数）</span></div>' +
+          '<div class="inp-box-row"><span>形状</span><span>[' + n + ']</span></div>' +
+          '<div class="inp-box-row"><span>内容</span><span>本批 token id 序列</span></div>' +
+          '<div class="inp-box-row"><span>角色</span><span>计算图的输入节点（ggml_set_input）</span></div>' +
+        '</div></div>' +
+        '<div class="flow-station">' + embLookupHTML(info) + '</div>' +
+        '<div class="flow-station"><div class="flow-ids">' + node('embeddings', 'F32 · [' + n + ', ' + MODEL.hidden + ']', 'attn') +
+          '<span class="flow-meta">每个 token 变一个向量</span></div></div>' +
+      '</div>';
+
+    // 图二：代码实现
+    var code =
+      '<div class="code-wrap">' +
+        '<div class="code-head">' +
+          '<span>inp_tokens 的创建 · <code>src/llama-graph.cpp</code></span>' +
+          '<a class="code-link" href="https://github.com/ggml-org/llama.cpp/blob/master/src/llama-graph.cpp#L2316" target="_blank" rel="noreferrer">查看源码 ↗</a>' +
+        '</div>' +
+        '<pre class="code-body">' +
+'<span class="c-fn">llm_graph_context::build_inp_embd()</span>\n' +
+'\n' +
+'<span class="c-num">1</span>  inp->tokens = <span class="c-fn">ggml_new_tensor_1d</span>(ctx0, GGML_TYPE_I32, ubatch.n_tokens);\n' +
+'   <span class="c-cm">// 建一维 I32 张量，长度 = 本批 token 数（当前 ubatch.n_tokens = ' + n + '）</span>\n' +
+'\n' +
+'<span class="c-num">2</span>  <span class="c-fn">cb</span>(inp->tokens, "inp_tokens", -1);\n' +
+'   <span class="c-cm">// 把这枚张量命名为 "inp_tokens"</span>\n' +
+'\n' +
+'<span class="c-num">3</span>  <span class="c-fn">ggml_set_input</span>(inp->tokens);\n' +
+'   <span class="c-cm">// 标记为计算图输入：数据不来自图内计算，而由 set_inputs 从外部填入</span>\n' +
+'\n' +
+'<span class="c-num">4</span>  res->t_inp_tokens = inp->tokens;\n' +
+'   <span class="c-cm">// 保存引用，供 token_embd 查表时取用</span>' +
+        '</pre>' +
+      '</div>';
+
+    return flow + code;
+  }
+
+  // 在数据流图左侧绘制曲线，串联各站点，并在曲线上标注每段的转换说明
+  function drawFlowCurve(root) {
+    if (!root || typeof root.querySelector !== 'function') return;
+    var flow = root.querySelector('.flow');
+    if (!flow || typeof flow.getBoundingClientRect !== 'function') return;
+    if (typeof document.createElementNS !== 'function' || typeof document.createElement !== 'function') return;
+
+    // 清理旧图层
+    var olds = flow.querySelectorAll ? flow.querySelectorAll('.flow-svg, .flow-label') : [];
+    for (var d = 0; d < olds.length; d++) {
+      if (olds[d].parentNode) olds[d].parentNode.removeChild(olds[d]);
+    }
+    var stations = flow.querySelectorAll ? flow.querySelectorAll('.flow-station') : [];
+    if (!stations || stations.length < 2) return;
+
+    var fb = flow.getBoundingClientRect();
+    if (!fb || !fb.height || !fb.width) return; // 未布局（例如无头测试环境）
+
+    var pts = [];
+    for (var i = 0; i < stations.length; i++) {
+      var r = stations[i].getBoundingClientRect();
+      pts.push({ x: r.left - fb.left, y: r.top - fb.top + r.height / 2 });
+    }
+    var trackX = 44; // 曲线所在 x（左侧轨道区）
+
+    var NS = 'http://www.w3.org/2000/svg';
+    var svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('class', 'flow-svg');
+    svg.setAttribute('width', String(fb.width));
+    svg.setAttribute('height', String(fb.height));
+
+    // 每段（相邻两站之间）各画一条曲线，并各自带圆点（起点）与箭头（终点）
+    for (var k = 0; k < pts.length - 1; k++) {
+      var a = pts[k], b = pts[k + 1];
+      var x0 = a.x, y0 = a.y + 6;  // 本段起点：圆点，贴本站左边缘、偏下
+      var x1 = b.x, y1 = b.y - 6;  // 本段终点：箭头，贴下一站左边缘、偏上
+
+      var path = document.createElementNS(NS, 'path');
+      path.setAttribute('class', 'flow-curve');
+      path.setAttribute('d', 'M ' + x0 + ' ' + y0 +
+                             ' C ' + trackX + ' ' + y0 + ', ' + trackX + ' ' + y1 + ', ' + x1 + ' ' + y1);
+      svg.appendChild(path);
+
+      var dot = document.createElementNS(NS, 'circle');
+      dot.setAttribute('class', 'flow-dot');
+      dot.setAttribute('cx', String(x0));
+      dot.setAttribute('cy', String(y0));
+      dot.setAttribute('r', '3.5');
+      svg.appendChild(dot);
+
+      var head = document.createElementNS(NS, 'path');
+      head.setAttribute('class', 'flow-head');
+      head.setAttribute('d', 'M ' + (x1 - 9) + ' ' + (y1 - 4) + ' L ' + (x1 + 1) + ' ' + y1 +
+                              ' L ' + (x1 - 9) + ' ' + (y1 + 4) + ' z');
+      svg.appendChild(head);
+    }
+
+    flow.appendChild(svg);
+
+    // 曲线上的标签（每段一个）
+    var labels = ['BPE 分词', '写入图输入', 'token_embd 查表'];
+    for (var t = 0; t < labels.length && t < pts.length - 1; t++) {
+      var midY = (pts[t].y + pts[t + 1].y) / 2;
+      var lab = document.createElement('div');
+      lab.className = 'flow-label';
+      lab.style.top = midY + 'px';
+      lab.textContent = labels[t];
+      flow.appendChild(lab);
+    }
   }
 
   // ---------------------------------------------------------- GGUF 元数据字段解释
@@ -550,24 +874,137 @@
   ];
 
   // ================================================================ 阶段 2：构建计算图
-  function layerBody() {
-    var attn = row([
-      node('attn_norm', 'RMSNorm', 'norm'),
-      node('QKV proj', 'MUL_MAT', 'attn'),
-      node('RoPE', 'position', 'attn'),
-      node('KV cache', 'write', 'cache'),
-      node('attention', 'GQA+softmax', 'attn'),
-      node('Wo', 'MUL_MAT', 'attn'),
-      node('+ residual', 'ADD', 'out')
-    ]);
-    var ffn = row([
-      node('ffn_norm', 'RMSNorm', 'norm'),
-      node('gate / up', 'MUL_MAT', 'mlp'),
-      node('SiLU', 'swiglu', 'mlp'),
-      node('down', 'MUL_MAT', 'mlp'),
-      node('+ residual', 'ADD', 'out')
-    ]);
-    return '<div class="layer-body">' + attn + ffn + '</div>';
+  function layerBody(i) {
+    var n = tokenCount();
+    var H = MODEL.hidden;
+    var qd = MODEL.heads * MODEL.headDim;    // Q 投影输出维度
+    var kvd = MODEL.kvHeads * MODEL.headDim; // K/V 投影输出维度
+    var F = MODEL.ffn;
+
+    // 行单元：{name, op, dim, cls} 普通行 | {fork:true} 分叉行 | {tri:[...]} 三列并发行
+    var rows = [
+      { name: '输入 embeddings', op: '来自上一层输出（第 0 层来自 token 查表）', dim: '[' + n + ', ' + H + ']', cls: 'input' },
+      { name: 'attn_norm', op: 'RMSNorm', dim: 'x_norm [' + n + ', ' + H + ']', cls: 'norm' },
+      { fork: true },
+      { tri: [
+        { blocks: [
+            { name: 'Q proj', op: 'x_norm · Wq', dim: 'Q [' + n + ', ' + qd + ']', cls: 'attn' },
+            { name: 'RoPE', op: '旋转 Q（前 ' + MODEL.headDim + ' 维）', dim: 'Q [' + n + ', ' + MODEL.heads + ', ' + MODEL.headDim + ']', cls: 'attn' }
+          ], tag: '' },
+        { blocks: [
+            { name: 'K proj', op: 'x_norm · Wk', dim: 'K [' + n + ', ' + kvd + ']', cls: 'attn' },
+            { name: 'RoPE', op: '旋转 K（前 ' + MODEL.headDim + ' 维）', dim: 'K [' + n + ', ' + MODEL.kvHeads + ', ' + MODEL.headDim + ']', cls: 'attn' }
+          ], tag: '写入 KV cache' },
+        { blocks: [
+            { name: 'V proj', op: 'x_norm · Wv', dim: 'V [' + n + ', ' + kvd + ']', cls: 'attn' }
+          ], tag: '写入 KV cache' }
+      ] },
+      { merge: true },
+      { name: 'attention', op: 'Q·Kᵀ → softmax → ·V（' + MODEL.heads + ' 个 Q 头共享 ' + MODEL.kvHeads + ' 个 KV 头）', dim: 'attn_out [' + n + ', ' + qd + ']', cls: 'attn' },
+      { name: 'Wo', op: 'MUL_MAT ' + qd + ' → ' + H, dim: 'x_attn [' + n + ', ' + H + ']', cls: 'attn' },
+      { name: '⊕ 残差 ①', op: 'x = x_attn + x', dim: 'x [' + n + ', ' + H + ']', cls: 'resid', resid: 1 },
+      { name: 'ffn_norm', op: 'RMSNorm', dim: 'x_norm [' + n + ', ' + H + ']', cls: 'norm' },
+      { name: 'gate proj', op: 'MUL_MAT ' + H + ' → ' + F, dim: 'gate [' + n + ', ' + F + ']', cls: 'mlp' },
+      { name: 'up proj', op: 'MUL_MAT ' + H + ' → ' + F, dim: 'up [' + n + ', ' + F + ']', cls: 'mlp' },
+      { name: 'SiLU（SwiGLU）', op: 'gate ⊙ up', dim: '[' + n + ', ' + F + ']', cls: 'mlp' },
+      { name: 'down proj', op: 'MUL_MAT ' + F + ' → ' + H, dim: 'x_ffn [' + n + ', ' + H + ']', cls: 'mlp' },
+      { name: '⊕ 残差 ②', op: 'x = x_ffn + x', dim: 'x [' + n + ', ' + H + ']', cls: 'resid', resid: 2 },
+      { name: '输出', op: '→ 下一层', dim: '[' + n + ', ' + H + ']', cls: 'input' }
+    ];
+
+    var H_STEP = 30, H_FORK = 72, H_TRI = 160, H_CONN = 18;
+    var y = 0, y0 = 0, yRes1 = 0, yRes2 = 0;
+
+    var html = '<div class="lflow">';
+    rows.forEach(function (r, idx) {
+      var next = rows[idx + 1];
+      // 仅相邻"普通行"之间加圆点/箭头连线（分叉行、三列行、汇总行自带结构）
+      var needConn = next && !r.fork && !r.merge && !next.fork && !next.tri && !next.merge;
+
+      var h;
+      if (r.fork) {
+        h = H_FORK;
+        html += '<div class="lstep-fork">' + forkSVG() + '</div>';
+      } else if (r.merge) {
+        h = H_FORK;
+        html += '<div class="lstep-fork">' + mergeSVG() + '</div>';
+      } else if (r.tri) {
+        h = H_TRI;
+        html += '<div class="lstep-tri">' +
+          '<div class="ltri-cols">' + r.tri.map(function (col) {
+            var inner = '';
+            col.blocks.forEach(function (b, bi) {
+              if (bi > 0) inner += '<div class="ltri-conn"><i></i></div>';
+              inner += '<div class="ltri-box">' +
+                         '<span class="ltri-name ' + b.cls + '">' + esc(b.name) + '</span>' +
+                         '<span class="ltri-op">' + esc(b.op) + '</span>' +
+                         '<span class="ltri-dim">' + esc(b.dim) + '</span>' +
+                       '</div>';
+            });
+            if (col.tag) inner += '<span class="ltri-tag">' + esc(col.tag) + '</span>';
+            return '<div class="ltri-col">' + inner + '</div>';
+          }).join('') + '</div>' +
+        '</div>';
+      } else {
+        h = H_STEP;
+        var clickable = (r.name === 'attn_norm');
+        html += '<div class="lstep">' +
+          '<span class="lstep-node ' + r.cls + (clickable ? ' clickable' : '') + '"' +
+            (clickable ? ' data-detail="attn_norm" data-layer="' + i + '" title="点击查看数学过程"' : '') + '>' +
+            esc(r.name) + '</span>' +
+          '<span class="lstep-op">' + esc(r.op) + '</span>' +
+          '<span class="lstep-dim">' + esc(r.dim) + '</span>' +
+        '</div>';
+      }
+
+      if (idx === 0)                     y0    = y + h / 2;
+      if (r.resid === 1)                 yRes1 = y + h / 2;
+      if (r.resid === 2)                 yRes2 = y + h / 2;
+
+      y += h;
+
+      if (needConn) {
+        html += '<div class="lconn"><i></i></div>';
+        y += H_CONN;
+      }
+    });
+    // 残差旁路（CSS 折线）
+    html += '<div class="lpath" style="top:' + y0 + 'px;height:' + (yRes1 - y0) + 'px"></div>';
+    html += '<div class="lpath" style="top:' + yRes1 + 'px;height:' + (yRes2 - yRes1) + 'px"></div>';
+    html += '</div>';
+
+    return html;
+  }
+
+  // 三路并发分叉：直角；主干对准中间列，三支对准三列中心（86 / 272 / 458）
+  // 坐标系与三列同宽（172*3 + 14*2 = 544），1:1 映射，可精确对齐
+  function forkSVG() {
+    return '<svg class="lfork-svg" viewBox="0 0 544 72" aria-hidden="true">' +
+      '<circle class="lfork-dot" cx="272" cy="4" r="3.5"></circle>' +
+      '<path class="lfork-line" d="M 272 7 L 272 16 M 86 16 L 458 16' +
+        ' M 86 16 L 86 62 M 272 16 L 272 62 M 458 16 L 458 62"></path>' +
+      '<path class="lfork-head" d="M 82 61 L 86 71 L 90 61 z"></path>' +
+      '<path class="lfork-head" d="M 268 61 L 272 71 L 276 61 z"></path>' +
+      '<path class="lfork-head" d="M 454 61 L 458 71 L 462 61 z"></path>' +
+    '</svg>';
+  }
+
+  // 三列汇合：三条竖线（对准三列中心）汇到一条横线，再由中部引出主干到 attention
+  function mergeSVG() {
+    return '<svg class="lfork-svg" viewBox="0 0 544 72" aria-hidden="true">' +
+      '<circle class="lfork-dot" cx="86" cy="3" r="3.5"></circle>' +
+      '<circle class="lfork-dot" cx="272" cy="3" r="3.5"></circle>' +
+      '<circle class="lfork-dot" cx="458" cy="3" r="3.5"></circle>' +
+      '<path class="lfork-line" d="M 86 6 L 86 36 M 272 6 L 272 36 M 458 6 L 458 36' +
+        ' M 86 36 L 458 36 M 272 36 L 272 64"></path>' +
+      '<path class="lfork-head" d="M 268 63 L 272 71 L 276 63 z"></path>' +
+    '</svg>';
+  }
+
+  // 整组层块末尾的算子详情（若已展开）
+  function layerDetailFor() {
+    if (!LAYER_DETAIL) return '';
+    return layerDetailHTML(LAYER_DETAIL.op, LAYER_DETAIL.layer);
   }
 
   function layerBlock(i, open) {
@@ -576,36 +1013,56 @@
         '<span class="idx">blk.' + i + '.</span>' +
         '<span class="name">Transformer 层</span>' +
         '<span class="meta">attn + ffn</span>' +
-      '</div>' + layerBody() + '</div>';
+      '</div>' + layerBody(i) + '</div>';
   }
 
   var GRAPH_STEPS = [
     {
       title: '准备输入张量',
-      desc: '推理从 token 序列开始。文本先被分词（tokenize）成 token id，再通过 token_embd 查表得到每个 token 的向量表示（嵌入）。',
-      concepts: [
-        ['tokenize', '"你是谁" -> token id 列表（BPE 分词）'],
-        ['embeddings', 'token_embd.weight 是 [vocab, hidden] 的大表，查表即取行'],
-        ['batch', '一次送入的 token 序列，形状 [n_tokens, n_embd]']
-      ],
-      logs: [
-        { cls: 'l-graph', text: 'graph: build inp_tokens   = [3, 1] (I32)   tokens = [你是谁 的 id]' },
-        { cls: 'l-graph', text: 'graph: build inp_pos      = [3, 1] (I32)   positions = [0,1,2]' },
-        { cls: 'l-graph', text: 'graph: build token_embd   = MUL_MAT   [151936,1024] x [3,1]' }
-      ],
+      desc: '推理从 token 序列开始。文本先被分词（tokenize）成 token id，再通过 token_embd 查表得到每个 token 的向量表示（嵌入）。下方输入框可输入任意文本，实时查看当前模型真实的分词结果。',
+      concepts: function () {
+        return [
+          ['tokenize', '输入文本 -> token id 列表（byte-level BPE）'],
+          ['token', '词表里的一个子词片段（可能是整词、部分汉字或字节）'],
+          ['embeddings', 'token_embd.weight 是 [vocab, hidden] 的大表，查表即取行'],
+          ['batch', '一次送入的 token 序列，形状 [n_tokens, n_embd]']
+        ];
+      },
+      logs: function () {
+        var info = tokenizeInfo();
+        var n = info.ok ? info.toks.length : 0;
+        return [
+          { cls: 'l-graph', text: 'graph: build inp_tokens   = [' + n + ', 1] (I32)' },
+          { cls: 'l-graph', text: 'graph: build inp_pos      = [' + n + ', 1] (I32)   positions = [0..' + Math.max(0, n - 1) + ']' },
+          { cls: 'l-graph', text: 'graph: build token_embd   = MUL_MAT   [' + MODEL.vocab + ',' + MODEL.hidden + '] x [' + n + ',1]' }
+        ];
+      },
       render: function (box) {
+        var info = tokenizeInfo();
         box.innerHTML =
-          '<div class="output-box"><span class="prompt">输入文本：</span>你是谁</div>' +
-          '<div class="rowline" style="margin-top:16px">' +
-            node('"你是谁"', 'text', 'input') + arrow() +
-            node('tokenize', 'BPE', 'input') + arrow() +
-            node('[id0, id1, id2]', 'token ids', 'input') + arrow() +
-            node('inp_tokens', 'I32', 'weight') +
+          '<div class="output-box" style="display:flex;align-items:center;gap:8px">' +
+            '<span class="prompt">输入文本：</span>' +
+            '<input id="in-text" class="text-input" type="text" placeholder="输入任意文本…">' +
           '</div>' +
-          '<div class="rowline" style="margin-top:12px">' +
-            node('token_embd', 'MUL_MAT lookup', 'weight') + arrow() +
-            node('embeddings', '[3, 1024]', 'attn') +
-          '</div>';
+          '<div id="tok-stat">' + tokenStatHTML(info) + '</div>' +
+          '<div id="tok-table">' + (info.ok ? tokenTableHTML(info.toks) : '') + '</div>' +
+          '<div id="tok-nodes">' + tokenNodesHTML(info) + '</div>';
+        drawFlowCurve(box);
+        var inp = box.querySelector('#in-text');
+        if (inp) {
+          inp.value = INPUT_TEXT;
+          inp.addEventListener('input', function () {
+            INPUT_TEXT = inp.value;
+            var inf = tokenizeInfo();
+            var st = box.querySelector('#tok-stat');
+            var tb = box.querySelector('#tok-table');
+            var nd = box.querySelector('#tok-nodes');
+            if (st) st.innerHTML = tokenStatHTML(inf);
+            if (tb) tb.innerHTML = inf.ok ? tokenTableHTML(inf.toks) : '';
+            if (nd) nd.innerHTML = tokenNodesHTML(inf);
+            drawFlowCurve(box);
+          });
+        }
       }
     },
     {
@@ -632,8 +1089,9 @@
           '<div class="layer-head"><span class="idx">blk.0.</span>' +
           '<span class="name">Transformer 层</span>' +
           '<span class="meta">' + MODEL.layers + ' 层中的第 0 层</span></div>' +
-          layerBody() + '</div>' +
-          '<p class="step-desc" style="margin-top:14px">上方为注意力子层，下方为前馈子层；两条 <code>+ residual</code> 为残差连接。</p>';
+          layerBody(0) + '</div>' +
+          '<p class="step-desc" style="margin-top:14px">上方为注意力子层，下方为前馈子层；两条 <code>+ residual</code> 为残差连接。</p>' +
+          layerDetailFor();
       }
     },
     {
@@ -654,7 +1112,7 @@
         html += '<div class="layer-fold">...  第 4 ~ 26 层省略（结构相同）  ...</div>';
         html += layerBlock(27, false);
         html += '</div>';
-        box.innerHTML = html;
+        box.innerHTML = html + layerDetailFor();
         // 点击展开/折叠
         Array.prototype.forEach.call(box.querySelectorAll('.layer-head'), function (head) {
           head.addEventListener('click', function () {
@@ -667,24 +1125,28 @@
       title: '输出头：归一化 + lm_head',
       desc: '最后一层的输出经过 output_norm 归一化，再由 lm_head 投影到词表维度，得到每个 token 的分数（logits）。',
       concepts: [
-        ['logits', '形状 [n_tokens, vocab]，每个位置对 15 万个 token 的分数'],
-        ['权重共享', 'Qwen3-0.6B 的 lm_head 与 token_embd 共享权重（tie）'],
+        ['logits', '形状 [n_tokens, vocab]，每个位置对全部 token 的分数'],
+        ['权重共享', 'lm_head 常与 token_embd 共享权重（tie）'],
         ['下一步', 'logits 交给采样器，选出一个 token 作为输出']
       ],
-      logs: [
-        { cls: 'l-graph', text: 'graph: build output_norm   = RMS_NORM' },
-        { cls: 'l-graph', text: 'graph: build result_output = MUL_MAT  [1024] x [151936,1024]' },
-        { cls: 'l-graph', text: 'graph: build -> logits     = [3, 151936] (F32)' }
-      ],
+      logs: function () {
+        var n = tokenCount();
+        return [
+          { cls: 'l-graph', text: 'graph: build output_norm   = RMS_NORM' },
+          { cls: 'l-graph', text: 'graph: build result_output = MUL_MAT  [' + MODEL.hidden + '] x [' + MODEL.vocab + ',' + MODEL.hidden + ']' },
+          { cls: 'l-graph', text: 'graph: build -> logits     = [' + n + ', ' + MODEL.vocab + '] (F32)' }
+        ];
+      },
       render: function (box) {
+        var n = tokenCount();
         box.innerHTML =
           row([
-            node('l_out (layer 27)', '[3, 1024]', 'attn'),
+            node('l_out (layer ' + (MODEL.layers - 1) + ')', '[' + n + ', ' + MODEL.hidden + ']', 'attn'),
             node('output_norm', 'RMSNorm', 'norm'),
             node('lm_head', 'MUL_MAT', 'weight'),
-            node('logits', '[3, 151936]', 'out')
+            node('logits', '[' + n + ', ' + MODEL.vocab + ']', 'out')
           ]) +
-          '<p class="step-desc" style="margin-top:16px">注意 logits 是 3 个位置各自的分数；生成时只关心最后一个位置。</p>' +
+          '<p class="step-desc" style="margin-top:16px">注意 logits 是 ' + n + ' 个位置各自的分数；生成时只关心最后一个位置。</p>' +
           '<div class="concept-card">计算图构建完成：一个从输入 token 到 logits 的有向无环图（DAG），共约 2240 个节点。</div>';
       }
     }
@@ -700,16 +1162,20 @@
         ['prefill', '一次喂入整段 prompt，可并行计算所有位置'],
         ['token 位置', '每个 token 需要位置索引，用于 RoPE 与 KV 写入']
       ],
-      logs: [
-        { cls: 'l-comp', text: 'llama_decode: batch 3 tokens (1 sequence)' },
-        { cls: 'l-comp', text: 'balloc: split -> 1 ubatch of 3 tokens' }
-      ],
+      logs: function () {
+        var n = tokenCount();
+        return [
+          { cls: 'l-comp', text: 'llama_decode: batch ' + n + ' tokens (1 sequence)' },
+          { cls: 'l-comp', text: 'balloc: split -> 1 ubatch of ' + n + ' tokens' }
+        ];
+      },
       render: function (box) {
+        var n = tokenCount();
         box.innerHTML =
           '<div class="rowline">' + node('llama_decode(batch)', 'API', 'input') + arrow() +
           node('balloc->init', 'planner', 'weight') + arrow() +
-          node('ubatch[0]', '3 tokens', 'attn') + '</div>' +
-          '<div class="concept-card" style="margin-top:16px">prompt 处理（prefill）阶段：3 个 token 可一次并行算完。</div>';
+          node('ubatch[0]', n + ' tokens', 'attn') + '</div>' +
+          '<div class="concept-card" style="margin-top:16px">prompt 处理（prefill）阶段：' + n + ' 个 token 可一次并行算完。</div>';
       }
     },
     {
@@ -720,23 +1186,26 @@
         ['复用', '多序列/多会话各自占用不同区间'],
         ['失败返回 1', '找不到槽位时返回 1，调用方可做上下文管理']
       ],
-      logs: [
-        { cls: 'l-comp', text: 'llama_kv_cache: init_batch: n_tokens = 3, n_ctx = ' + KV_DEMO_CTX },
-        { cls: 'l-comp', text: 'llama_kv_cache: find_slot: assigned positions [0, 1, 2]' }
-      ],
+      logs: function () {
+        var n = tokenCount();
+        return [
+          { cls: 'l-comp', text: 'llama_kv_cache: init_batch: n_tokens = ' + n + ', n_ctx = ' + KV_DEMO_CTX },
+          { cls: 'l-comp', text: 'llama_kv_cache: find_slot: assigned positions [0..' + Math.max(0, n - 1) + ']' }
+        ];
+      },
       render: function (box) {
+        var n = Math.min(tokenCount(), 48);
         var cells = '';
         for (var i = 0; i < 48; i++) {
-          cells += '<div class="kv-cell' + (i < 3 ? ' filled' : '') + '"></div>';
+          cells += '<div class="kv-cell' + (i < n ? ' filled' : '') + '"></div>';
         }
+        var posNodes = [];
+        for (var k = 0; k < Math.min(n, 6); k++) posNodes.push(node('pos ' + k, 'token ' + k, 'input'));
         box.innerHTML =
           '<div style="font-family:var(--mono);font-size:11.5px;color:var(--text-dim);margin-bottom:8px">KV cache 位置（前 48 个示意）</div>' +
           '<div class="kv-grid">' + cells + '</div>' +
-          '<div class="rowline" style="margin-top:14px">' +
-            node('pos 0', 'token id0', 'input') + arrow() +
-            node('pos 1', 'token id1', 'input') + arrow() +
-            node('pos 2', 'token id2', 'input') +
-          '</div>';
+          '<div class="rowline" style="margin-top:14px">' + posNodes.join(arrow()) + '</div>' +
+          (n > 6 ? '<p class="step-desc">（仅列出前 6 个位置，共 ' + n + ' 个）</p>' : '');
       }
     },
     {
@@ -747,15 +1216,19 @@
         ['set_inputs', '把 token id / 位置等写入图的输入张量'],
         ['graph_params', 'ubatch + memory 上下文 + 图类型 共同决定拓扑']
       ],
-      logs: [
-        { cls: 'l-comp', text: 'process_ubatch: graph_params (n_tokens=3, n_seqs=1)' },
-        { cls: 'l-comp', text: 'process_ubatch: can_reuse = false (first run) -> build_graph' },
-        { cls: 'l-comp', text: 'process_ubatch: set_inputs -> inp_tokens, inp_pos, KQ_mask' }
-      ],
+      logs: function () {
+        var n = tokenCount();
+        return [
+          { cls: 'l-comp', text: 'process_ubatch: graph_params (n_tokens=' + n + ', n_seqs=1)' },
+          { cls: 'l-comp', text: 'process_ubatch: can_reuse = false (first run) -> build_graph' },
+          { cls: 'l-comp', text: 'process_ubatch: set_inputs -> inp_tokens, inp_pos, KQ_mask' }
+        ];
+      },
       render: function (box) {
+        var n = tokenCount();
         box.innerHTML =
           '<div class="rowline">' +
-            node('ubatch', '3 tokens', 'attn') + arrow() +
+            node('ubatch', n + ' tokens', 'attn') + arrow() +
             node('graph_params', '决策', 'weight') + arrow() +
             node('can_reuse?', '是/否', 'norm') +
           '</div>' +
@@ -801,15 +1274,18 @@
         ['多线程', 'CPU 后端按 n_threads 把节点任务分给线程池'],
         ['logits 拷回', '结果从设备缓冲拷回主机，供采样器读取']
       ],
-      logs: [
-        { cls: 'l-comp', text: 'compute_splits: split 0 (CPU)  graph_compute' },
-        { cls: 'l-time', text: 'compute_splits: split 0 done (embd)' },
-        { cls: 'l-comp', text: 'compute_splits: split 1 (GPU)  graph_compute' },
-        { cls: 'l-time', text: 'compute_splits: split 1 done (20 layers)' },
-        { cls: 'l-comp', text: 'compute_splits: split 2 (CPU)  graph_compute' },
-        { cls: 'l-info', text: 'llama_decode: copy logits to host (3 x 151936)' },
-        { cls: 'l-time', text: 'llama_perf: eval time = 128.40 ms / 3 tokens' }
-      ],
+      logs: function () {
+        var n = tokenCount();
+        return [
+          { cls: 'l-comp', text: 'compute_splits: split 0 (CPU)  graph_compute' },
+          { cls: 'l-time', text: 'compute_splits: split 0 done (embd)' },
+          { cls: 'l-comp', text: 'compute_splits: split 1 (GPU)  graph_compute' },
+          { cls: 'l-time', text: 'compute_splits: split 1 done (20 layers)' },
+          { cls: 'l-comp', text: 'compute_splits: split 2 (CPU)  graph_compute' },
+          { cls: 'l-info', text: 'llama_decode: copy logits to host (' + n + ' x ' + MODEL.vocab + ')' },
+          { cls: 'l-time', text: 'llama_perf: eval time = 128.40 ms / ' + n + ' tokens' }
+        ];
+      },
       render: function (box) {
         var threads = '';
         for (var i = 0; i < 8; i++) threads += '<div class="thread" data-i="' + i + '">T' + i + '</div>';
@@ -879,18 +1355,22 @@
         ['logits', '未归一化的分数，可为任意实数'],
         ['温度前', '此时还没做 softmax，不能直接当概率用']
       ],
-      logs: [
-        { cls: 'l-samp', text: 'llama_get_logits_ith: idx = -1 (最后一个位置)' },
-        { cls: 'l-samp', text: 'logits shape = [151936], dtype = F32' }
-      ],
+      logs: function () {
+        var n = tokenCount();
+        return [
+          { cls: 'l-samp', text: 'llama_get_logits_ith: idx = -1 (最后一个位置)' },
+          { cls: 'l-samp', text: 'logits shape = [' + n + ', ' + MODEL.vocab + '], dtype = F32' }
+        ];
+      },
       render: function (box) {
+        var n = tokenCount();
         box.innerHTML =
           row([
-            node('logits', '[3, 151936]', 'weight'),
+            node('logits', '[' + n + ', ' + MODEL.vocab + ']', 'weight'),
             node('取最后一行', 'idx=-1', 'norm'),
-            node('分数向量', '[151936]', 'input')
+            node('分数向量', '[' + MODEL.vocab + ']', 'input')
           ]) +
-          '<div class="concept-card" style="margin-top:16px">15 万个候选，每个都有一个分数；分数越大表示模型越"倾向"该 token。</div>';
+          '<div class="concept-card" style="margin-top:16px">' + MODEL.vocab + ' 个候选，每个都有一个分数；分数越大表示模型越"倾向"该 token。</div>';
       }
     },
     {
@@ -967,7 +1447,7 @@
         box.innerHTML =
           histHTML(cs, { sel: 0 }) +
           '<div class="output-box" style="margin-top:16px">' +
-            '<span class="prompt">你是谁</span><span class="gen">我可以帮你回答各种问题</span>' +
+            '<span class="prompt">' + esc(INPUT_TEXT) + '</span><span class="gen">我可以帮你回答各种问题</span>' +
             '<span class="cursor"></span>' +
           '</div>' +
           '<div class="rowline" style="margin-top:14px">' +
@@ -1006,6 +1486,30 @@
         var f = e.target.files && e.target.files[0];
         if (f) self.loadModelFile(f);
       });
+      // 算子点击（事件委托：只有 .clickable 会响应）
+      var vizEl = document.getElementById('viz');
+      if (vizEl && vizEl.addEventListener) {
+        vizEl.addEventListener('click', function (e) {
+          var t = e.target;
+          while (t && t !== vizEl) {
+            var cls = t.className ? String(t.className) : '';
+            if (cls.indexOf('clickable') !== -1) {
+              var op = t.getAttribute ? t.getAttribute('data-detail') : null;
+              var lyr = t.getAttribute ? parseInt(t.getAttribute('data-layer'), 10) : NaN;
+              if (op) {
+                if (LAYER_DETAIL && LAYER_DETAIL.op === op && LAYER_DETAIL.layer === lyr) {
+                  LAYER_DETAIL = null; // 再点一次收起
+                } else {
+                  LAYER_DETAIL = { layer: lyr, op: op };
+                }
+                self.render();
+              }
+              return;
+            }
+            t = t.parentNode;
+          }
+        });
+      }
       window.addEventListener('keydown', function (e) {
         if (e.key === 'ArrowRight') self.next();
         if (e.key === 'ArrowLeft') self.prev();
@@ -1026,8 +1530,11 @@
       var fr = new FileReader();
       fr.onload = function () {
         try {
-          var info = window.parseGGUF(fr.result);
+          var info = window.parseGGUF(fr.result, {
+            fullKeys: { 'tokenizer.ggml.tokens': 1, 'tokenizer.ggml.merges': 1 }
+          });
           setModelFromGGUF(info, file);
+          buildTokenizer(info);
           self.stopPlay();
           self.stage = 0;
           self.step = 0;
@@ -1214,6 +1721,10 @@
       document.getElementById('btn-prev').disabled = (this.stage === 0 && this.step === 0);
       document.getElementById('btn-next').disabled =
         (this.stage === STAGES.length - 1 && this.step === stage.steps.length - 1);
+
+      // 若有算子详情面板展开，排版其中的 LaTeX
+      var detEl = document.getElementById('layer-detail');
+      if (detEl) typesetMath(detEl);
     }
   };
 

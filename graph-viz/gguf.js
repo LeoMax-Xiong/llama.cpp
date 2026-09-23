@@ -49,7 +49,7 @@
   };
 
   // 读取一个值；type 为 GGUF 值类型
-  function readValue(r, type) {
+  function readValue(r, type, full) {
     switch (type) {
       case 0: return r.u8v();
       case 1: return r.i8v();
@@ -66,13 +66,13 @@
       case 9: {
         var et = r.u32();
         var n = r.u64();
-        var keep = Math.min(n, ARRAY_SAMPLE);
+        var keep = full ? n : Math.min(n, ARRAY_SAMPLE);
         var sample = [];
         for (var i = 0; i < n; i++) {
-          if (i < keep) sample.push(readValue(r, et));
+          if (i < keep) sample.push(readValue(r, et, full));
           else skipValue(r, et); // 其余元素必须跳过以保持偏移正确
         }
-        return { __array: true, elemType: GGUF_TYPE[et] || String(et), count: n, sample: sample };
+        return { __array: true, elemType: GGUF_TYPE[et] || String(et), count: n, sample: sample, full: !!full };
       }
     }
     throw new Error('未知的 GGUF 值类型: ' + type);
@@ -97,7 +97,8 @@
   }
 
   // 解析入口：buf 为 ArrayBuffer（至少覆盖到 tensor info 段末尾）
-  function parseGGUF(buf) {
+  function parseGGUF(buf, opts) {
+    var fullKeys = (opts && opts.fullKeys) || {};
     var r = new Reader(buf);
     var magic = String.fromCharCode(r.u8v(), r.u8v(), r.u8v(), r.u8v());
     if (magic !== 'GGUF') throw new Error('不是 GGUF 文件（magic = "' + magic + '"）');
@@ -109,7 +110,7 @@
     for (var i = 0; i < nKv; i++) {
       var key = r.str();
       var type = r.u32();
-      metadata.push({ key: key, type: GGUF_TYPE[type] || ('TYPE_' + type), value: readValue(r, type) });
+      metadata.push({ key: key, type: GGUF_TYPE[type] || ('TYPE_' + type), value: readValue(r, type, !!fullKeys[key]) });
     }
 
     // metadata（kv）段结束的位置，即 tensor info 段起点
