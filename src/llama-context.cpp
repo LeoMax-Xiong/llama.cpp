@@ -1328,7 +1328,13 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// 构建并执行一个物理 ubatch 的前向计算图（decode/encode 的真正计算核心）。
+// 返回持有输出张量（logits/embeddings）的 llm_graph_result；失败时置 ret 并返回 nullptr。
+// 流程：应用 memory（KV cache）上下文 -> 由 (ubatch, mctx, gtype) 计算图参数 gparams ->
+//       若图拓扑与上次一致则复用上次的图（跳过构图/分配），否则重建并分配 ->
+//       写入输入数据 -> graph_compute 提交后端执行。
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // 应用 memory（KV cache）上下文：布置本 ubatch 各 token 的 KV 槽位与注意力映射
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1338,16 +1344,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
-    // the new graph parameters
-    // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+    // 本次图的参数：图能否复用取决于这些参数（图拓扑须由它们唯一确定）
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    // 图复用优化：图拓扑与上次一致时直接复用上次的计算图，跳过构图与张量分配
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
-        // with pipeline parallelism, the previous graph_compute_async may still be running
-        // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading.
+        // 流水线并行时上一次 graph_compute_async 可能仍在 GPU 上运行，
+        // set_inputs 前必须先同步，避免覆盖仍在被读取的输入张量
         if (cparams.pipeline_parallel) {
             ggml_backend_sched_synchronize(sched.get());
         }
@@ -1361,6 +1366,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
+        // 重新构图：把模型各层的算子搭进一张 GGML 计算图
         gf = model.build_graph(gparams);
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
@@ -1371,6 +1377,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        // 为图中的张量分配后端缓冲区
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -1378,16 +1385,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
-    // set the input data for the input tensors
+    // 把本 ubatch 的输入数据（token id/embd/位置等）写入图的输入张量
     {
         //const auto t_start_us = ggml_time_us();
 
-        // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        // FIXME 若某些模型输入未在图中使用而未分配，此调用会崩溃
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // 提交计算图到后端执行（CPU/GPU 上的真正前向计算）
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
@@ -1638,16 +1646,27 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+// llama_decode 的实现：处理一个逻辑 batch（可含多序列、多 token），完整驱动一次模型前向。
+// 流程概述：
+//   1) 校验输入，用 batch allocator 规划 batch（拆分为物理 ubatch），为 token 在 KV cache 中找槽位；
+//   2) 槽位不足时尝试一次缓存优化后重试，仍失败返回 1（警告）；
+//   3) 预留输出缓冲，开启采样事务；
+//   4) 主循环逐 ubatch 执行真正的前向计算（见下方 process_ubatch 调用处），
+//      并把 logits/embeddings/后端采样结果从后端异步拷回 host 缓冲；
+//   5) 整理输出行映射，使结果顺序与用户 batch 一致。
+// 返回：0 成功；1 找不到 KV slot；2 被中止；负数错误。
 int llama_context::decode(const llama_batch & batch_inp) {
-    // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
-    // so accept either present rather than requiring exactly one.
+    // MTP 钩子批次同时携带 token（下一 token id）与 embd（h_nextn 行），
+    // 因此两者任一存在即可，不必强求恰好一个
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
 
+    // 无 memory（KV cache）说明本上下文为编码器专用（encoder-only），改用 encode()
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
     }
 
+    // 空 batch 是无效输入
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -1657,6 +1676,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const auto & hparams = model.hparams;
 
     const int64_t n_vocab = vocab.n_tokens();
+    // MTP 上下文可用 embd（下一 token 的隐状态）作为输入，此时输入维度取输出维度
     const bool    mtp_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.embd;
     const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : hparams.n_embd_inp();
 
@@ -1697,6 +1717,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    // 用 batch allocator 规划逻辑 batch：拆分为物理 ubatch，确定每个 token 的输入/输出位置
     if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
@@ -1736,11 +1757,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     bool did_optimize = false;
 
-    // handle any pending shifts/copies
+    // 先应用待执行的 KV cache 移位/拷贝（如上下文滑动、序列复制），再做后续处理
     memory_update(false);
 
     llama_memory_context_ptr mctx;
 
+    // 在 KV cache（memory）中为本 batch 分配槽位并切出 ubatch；
+    // 槽位不足（FAILED_PREPARE）时先做一次缓存优化再重试，仍不足返回 1
     while (true) {
         mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
         if (!mctx) {
@@ -1784,13 +1807,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
         break;
     }
 
-    // reserve output buffer
+    // 为全部输出预留 host 侧缓冲
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
 
-    // start a new sampling transaction for this logical batch
+    // 开启本次逻辑 batch 的采样事务
     for (const auto & entry : sampling.samplers) {
         llama_sampler_backend_begin(entry.second);
     }
@@ -1798,6 +1821,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    // 主循环：逐段处理物理 ubatch（大 batch 会被切成多段依次前向）
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -1819,6 +1843,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
+        // === decode 的真正前向计算发生处 ===
+        // process_ubatch 为当前 ubatch 构建 GGML 计算图并提交执行，
+        // 模型算子经后端调度器（sched）分发到 CPU/GPU；结果（logits/embeddings）保存在 llm_graph_result 中
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {
@@ -1975,7 +2002,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
 
-    // set to total number of outputs in the batch, for use in llama_get_logits_ith
+    // 记录本 batch 总输出数，供 llama_get_logits_ith 等使用
     n_outputs = n_outputs_all;
 
     // set output mappings
@@ -1994,8 +2021,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        // make the outputs have the same order they had in the user-provided batch
-        // note: this is mostly relevant for recurrent models atm
+        // 使输出顺序与用户提供的 batch 顺序一致
+        // 注意：目前主要对循环（recurrent）模型有意义
         if (!sorted_output && n_outputs > 1) {
             GGML_ASSERT((size_t) n_outputs == out_ids.size());
 
@@ -2478,9 +2505,14 @@ llm_graph_params llama_context::graph_params(
     };
 }
 
+// 提交计算图给后端调度器执行（CPU/GPU 上的真正前向计算）。
+// 先按 batched 选择线程配置并同步到 CPU 后端与所有注册的后端，
+// 随后 ggml_backend_sched_graph_compute_async 将图切分（splits）并异步分发到各后端执行。
+// 返回执行状态（GGML_STATUS_SUCCESS 或错误码）。
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
+    // batched：批量处理多 token 时用 batch 线程池，单 token 生成时用生成线程池
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -2488,15 +2520,17 @@ ggml_status llama_context::graph_compute(
         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
         auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
         if (set_threadpool_fn) {
+            // 为 CPU 后端设置线程池
             set_threadpool_fn(backend_cpu, tp);
         }
     }
 
-    // set the number of threads for all the backends
+    // 为所有后端设置线程数
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    // 核心调用：把计算图切分后异步提交到各后端执行
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -4136,10 +4170,16 @@ int32_t llama_encode(
     return ret;
 }
 
+// llama_decode 的公共 API：对一批 token 做模型前向计算（prompt 处理或逐 token 生成），
+// 供之后用 llama_get_logits_ith / llama_sampler_sample 等取出本批各输出（logits 或采样结果）。
+// 薄分发层，实际工作委托给 llama_context::decode()。
+// 返回值：0 成功；1 未找到 KV slot（警告，可缩小 batch 或增大上下文重试）；
+// 2 被中止；-1 无效输入 batch；< -1 致命错误。仅对非 0/1 的返回值记录错误日志。
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
     const int ret = ctx->decode(batch);
+    // ret == 1（KV slot 不足）属于警告而非错误，不记日志
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }

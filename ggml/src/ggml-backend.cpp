@@ -761,14 +761,36 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_COPIES 4
 #endif
 
+// 调度器把一整张计算图按后端切分后得到的一段（split）：
+// 段内所有节点归属同一个后端（backend_id），在完整图节点数组中占据区间 [i_start, i_end)。
+// inputs 是本段需要的跨后端输入张量（来自其他后端或用户数据），执行前须先拷贝到本后端；
+// graph 是从完整图中截取的本段子图（ggml_graph_view），提交给该后端独立执行。
+//
+// 切分方式（split_graph）：图的 nodes[] 是按依赖关系的执行序列（拓扑序），
+// 调度器先为每个节点分配后端（通常由权重所在后端决定），再沿该一维序列把连续同后端
+// 的节点聚成一段，后端切换处切开；view 类操作不计入切分，随所在段归属。
+// 除后端切换外，以下情况也会强制切一刀（need_new_split）：
+//   - 节点的权重在别的后端且当前后端不支持其 buffer 类型（也让之前 offload 的权重显存可复用）
+//   - 本段需要收集的跨后端输入张量超过 inputs 容量
+// 段与段之间串行执行，数据依赖靠把上一段输出作为 inputs 拷入下一段来衔接。
+//
+// 示意（部分层 offload 到 GPU、其余留在 CPU 的模型）：
+//   nodes 序列（执行序）: [embd] [layer0] [layer1] [layer2] [layer3] [norm] [head]
+//   后端着色:             CPU    GPU      GPU      GPU      CPU      CPU    CPU
+//
+//   切分结果（连续同色段）：
+//     split 0: [embd]                    -> CPU, 区间 [0, 1)
+//     split 1: [layer0][layer1][layer2]  -> GPU, 区间 [1, 4)
+//     split 2: [layer3][norm][head]      -> CPU, 区间 [4, 7)
+
 struct ggml_backend_sched_split {
-    int backend_id;
-    int i_start;
-    int i_end;
-    struct ggml_tensor ** inputs;
-    int n_inputs;
-    int inputs_capacity;
-    // graph view of this split
+    int backend_id;                 // 本段归属的后端 id（段内所有节点都在该后端计算）
+    int i_start;                    // 本段在完整图节点数组中的起始索引（含）
+    int i_end;                      // 结束索引（不含）；为切分点或整图末尾
+    struct ggml_tensor ** inputs;   // 本段需要的跨后端输入张量（执行前拷到本后端）
+    int n_inputs;                   // 已收集的输入张量个数
+    int inputs_capacity;            // inputs 数组当前容量
+    // 本段的图视图（截取自完整图的子图）
     struct ggml_cgraph graph;
 };
 
@@ -1591,6 +1613,11 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// 逐个执行调度器切分好的子图（splits），是图计算的真正执行阶段。
+// 对每个 split：先确保依赖的前一个 split 已完成，再把输入张量拷贝/同步到目标后端
+// （卸载 MoE 权重时只拷贝本批用到的专家），然后异步提交该子图给对应后端执行；
+// 设置了 eval 回调时按回调需求逐段执行，回调返回 false 可提前中止。
+// 任一后端失败即返回其错误码；全部成功返回 GGML_STATUS_SUCCESS。
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1601,13 +1628,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // 通常计算中 n_splits 为1，即不使用异构的芯片进行处理
+    // 在2026年通过offload cpu的技术已经不是主流的技术
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
-        // ensure the previous split's async work has completed before we start
-        // this split, the allocator may have reused buffer regions across splits
+        // 确保上一个 split 的异步计算已完成再开始本 split：分配器可能跨 split 复用了缓冲区域
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
@@ -1616,14 +1644,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // copy the input tensors to the split backend
+        // 把本 split 的输入张量拷贝到目标后端
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
-                // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                // 用户输入必须立即拷贝，防止用户在异步拷贝完成前覆盖数据
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
@@ -1631,14 +1659,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
-                // wait for the split backend to finish using the input before overwriting it
+                // 先等目标后端用完该输入再覆盖它，避免覆盖仍在被异步读取的旧缓冲
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
 
-                // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
+                // 卸载（offload）MoE 权重时，只拷贝本批实际用到的专家，大幅减少拷贝量
                 ggml_tensor * node = split->graph.nodes[0];
                 if (split->graph.n_nodes > 0 &&
                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
@@ -1652,12 +1680,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     ggml_backend_synchronize(input_backend);
 
-                    // get the ids
+                    // 取回本批选中的专家 id（来自 MUL_MAT_ID 的 ids 输入）
                     ggml_tensor * ids_tensor = node->src[2];
                     ggml_backend_t ids_backend = split_backend;
 
-                    // if the ids tensor is also an input of the split, it may not have been copied yet to the split backend
-                    // in that case, we use the original ids tensor
+                    // 若 ids 张量也是本 split 的输入且尚未拷到目标后端，则直接使用原张量
                     for (int i = input_id + 1; i < split->n_inputs; i++) {
                         if (ids_tensor == tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy)) {
                             ids_tensor = split->inputs[i];
@@ -1671,7 +1698,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
                         ggml_backend_synchronize(ids_backend);
 
-                        // find the used experts
+                        // 统计本批实际用到的专家集合
                         used_ids.clear();
                         used_ids.resize(ggml_bitset_size(n_expert));
                         for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
@@ -1685,7 +1712,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prev_ids_tensor = ids_tensor;
                     }
 
-                    // group consecutive experts and copy them together
+                    // 把连续使用的专家分组成段，逐段一次性拷贝
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
@@ -1695,8 +1722,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
                             (const uint8_t *)input->data + expert_offset, expert_offset,
-                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
-                            // this is necessary for MMQ in the CUDA backend
+                            // 末尾多拷一点填充，避免 CUDA 后端的 MMQ 在最后一个专家处读到 NaN
                             expert_size_copy + padding_end);
                     };
 
@@ -1724,8 +1750,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                     copy_experts(first_id, last_id);
                 } else {
-                    // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
-                    // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+                    // 优先尝试异步拷贝；不支持时退回同步拷贝（多份拷贝与 event 已保证同步正确性）
+                    // TODO: 增加公共函数以简化此逻辑（应用层无法直接访问后端接口）
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
                         ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1745,40 +1771,48 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 return ec;
             }
         } else {
-            // similar to ggml_backend_compare_graph_backend
+            // 用户注册了 eval 回调（ggml_backend_sched_set_eval_callback）时才走到这里。
+            // 回调契约（见 ggml-backend.h）：callback(t, ask=true) 询问"是否要观察节点 t"；
+            // 某节点算完后 callback(t, ask=false) 把结果交给用户观察，返回 false 则中止整图计算。
+            // 与 ggml_backend_compare_graph_backend 的用法一致（用于逐节点调试/比较不同后端）。
+            // 正常推理（llama_decode）不注册回调，走上方 if 分支一次提交整个 split，无分段开销。
             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
                 struct ggml_tensor * t = split->graph.nodes[j0];
 
-                // check if the user needs data from this node
+                // 询问用户是否需要观察当前节点（ask == true）
                 bool need = sched->callback_eval(t, true, sched->callback_eval_user_data);
 
                 int j1 = j0;
 
-                // determine the range [j0, j1] of nodes that can be computed together
+                // 贪心向后吞并用户不需要观察的节点，直到区间 [j0, j1] 末尾是需要观察的节点或到达图尾。
+                // 目的：最小化"计算-同步-回调"次数，整段一次异步提交加一次同步，而非逐节点同步
                 while (!need && j1 < split->graph.n_nodes - 1) {
                     t = split->graph.nodes[++j1];
                     need = sched->callback_eval(t, true, sched->callback_eval_user_data);
                 }
 
+                // 截取 [j0, j1] 闭区间的子图视图：ggml_graph_view 以半开区间 [j0, j1+1) 共享节点，不复制张量
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
 
+                // 把这一小段（用户不关心的节点 + 末尾一个关心的节点）异步提交给本 split 的后端执行
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
                     return ec;
                 }
 
-                // TODO: pass backend to the callback, then the user can decide if they want to synchronize
+                // TODO: 把后端传给回调，让用户自行决定是否需要同步
+                // 等本段算完，再把末尾节点 nodes[j1]（need 为 true）交给用户观察
                 ggml_backend_synchronize(split_backend);
 
                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
-                    break;
+                    break; // 用户返回 false：中止整个计算
                 }
 
-                j0 = j1;
+                j0 = j1; // 跳到本段末尾，外层 for 的 j0++ 移到下一节点
             }
         }
 
-        // record the event of this split
+        // 记录本 split 的完成事件，供下一个 split 等待
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
         }
@@ -1958,18 +1992,24 @@ enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, st
     return err;
 }
 
+// 异步提交一张计算图给调度器执行：必要时先把图按张量所在后端切分为各后端的子图（splits）
+// 并分配张量缓冲区，然后提交执行；调用返回时计算未必完成（可调用 ggml_backend_sched_synchronize 等待）。
+// 成功返回 GGML_STATUS_SUCCESS，图分配失败返回 GGML_STATUS_ALLOC_FAILED。
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
+    // 全新调度器（既未 reset 也未分配过图）先重置内部缓存状态
     if (!sched->is_reset && !sched->is_alloc) {
         ggml_backend_sched_reset(sched);
     }
 
+    // 当前图尚未切分/分配缓冲：先完成 split（决定每个张量归属的后端）并分配
     if (!sched->is_alloc) {
         if (!ggml_backend_sched_alloc_graph(sched, graph)) {
             return GGML_STATUS_ALLOC_FAILED;
         }
     }
 
+    // 逐后端提交各自子图（splits）执行，实际计算在此发生
     return ggml_backend_sched_compute_splits(sched);
 }
 

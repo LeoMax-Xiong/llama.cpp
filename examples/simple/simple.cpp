@@ -83,7 +83,7 @@ int main(int argc, char ** argv) {
     ggml_backend_load_all();
 
     // initialize the model
-
+    // 设置初始化加载模型的参数，在初始化的时候只配置有多少层的网络负载到GPU上进行运算
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = ngl;
 
@@ -172,6 +172,7 @@ int main(int argc, char ** argv) {
 
     for (int n_pos = 0; n_pos + batch.n_tokens < n_prompt + n_predict; ) {
         // evaluate the current batch with the transformer model
+        // 开始针对 ctx 中的内容进行解码
         if (llama_decode(ctx, batch)) {
             fprintf(stderr, "%s : failed to eval, return code %d\n", __func__, 1);
             return 1;

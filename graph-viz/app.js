@@ -214,8 +214,16 @@
     else run();
   }
 
+  // 算子详情面板分发：按算子名选择对应的数学过程说明
   function layerDetailHTML(op, layer) {
-    if (op !== 'attn_norm') return '';
+    if (op === 'attn_norm') return detailAttnNorm(layer);
+    if (op === 'Q proj') return detailQProj(layer);
+    if (op === 'K proj') return detailKProj(layer);
+    if (op === 'V proj') return detailVProj(layer);
+    return '';
+  }
+
+  function detailAttnNorm(layer) {
     var d = MODEL.hidden;
     var eps = rmsEps();
     var n = tokenCount();
@@ -289,6 +297,189 @@
 
         '<h4>出处</h4>' +
         '<p class="ldetail-p">Zhang &amp; Sennrich, 2019, "Root Mean Square Layer Normalization", arXiv:1910.07467。</p>' +
+      '</div>' +
+    '</div>';
+  }
+
+  // Q proj：x_norm 到 Q 的线性投影（多头拼接后再 reshape）
+  function detailQProj(layer) {
+    var n = tokenCount();
+    var din = MODEL.hidden;
+    var heads = MODEL.heads;
+    var hd = MODEL.headDim;
+    var dout = heads * hd;
+    var kde = MODEL.kvHeads * hd;
+    var src = (layer != null && layer >= 0) ? '<span class="ldetail-src">来自 blk.' + layer + '.</span> ' : '';
+    return '<div class="ldetail" id="layer-detail">' +
+      '<div class="ldetail-head">' +
+        '<span>' + src + 'Q proj · 查询投影（Query projection）</span>' +
+        '<span class="ldetail-hint">再点一次算子名可收起</span>' +
+      '</div>' +
+      '<div class="ldetail-body">' +
+        '<p class="ldetail-p"><b>作用</b>：把 attn_norm 的输出 x_norm 线性投影成注意力要用的 Query 向量（每个 token 带上“我在找什么”的查询）。</p>' +
+        '<p class="ldetail-p"><b>输入 / 输出</b>：$x_{norm} \\in \\mathbb{R}^{n \\times d_{in}}$，' +
+          '$W_q \\in \\mathbb{R}^{d_{in} \\times d_{out}}$，输出 $Q \\in \\mathbb{R}^{n \\times d_{out}}$；' +
+          '其中 $n = ' + n + '$、$d_{in} = ' + din + '$、$d_{out} = ' + dout + '$。</p>' +
+
+        '<h4>① 矩阵乘法（行 · 列 做点积）</h4>' +
+        '$$ Q = x_{norm} \\cdot W_q $$' +
+        '$$ Q_{t,j} = \\sum_{k=1}^{' + din + '} x_{norm}[t,k] \\cdot W_q[k,j] $$' +
+        '<p class="ldetail-p">第 $t$ 个 token 的 ' + din + ' 维向量，与 $W_q$ 的第 $j$ 列做点积，得到该 token 的第 $j$ 个输出分量；$j$ 遍历 ' + dout + ' 列。</p>' +
+
+        '<h4>② 形状流转</h4>' +
+        '<p class="ldetail-p"><code>[' + n + ', ' + din + '] × [' + din + ', ' + dout + '] -> [' + n + ', ' + dout + ']</code></p>' +
+        '<p class="ldetail-p">token 维（$n$）不参与变换：每个 token 独立地做同一次投影。</p>' +
+
+        '<h4>③ 输出为什么是 ' + dout + '，不是 ' + din + '？</h4>' +
+        '<p class="ldetail-p">因为 Q 是<b>所有注意力头拼在一起</b>：' +
+          '$d_{out} = n_{head} \\times d_{head} = ' + heads + ' \\times ' + hd + ' = ' + dout + '$。</p>' +
+        '<p class="ldetail-p">对比 K/V：GQA 下 K/V 只有 $' + MODEL.kvHeads + '$ 个头，故 $d_{out}^{K} = ' + kde + '$。' +
+          '另外 Qwen3 的 $d_{head} = ' + hd + '$ 是模型显式设定的，不等于 $d_{in}/n_{head} = ' + (din / heads) + '$。</p>' +
+
+        '<h4>④ 紧接着拆成多头</h4>' +
+        '<p class="ldetail-p"><code>[' + n + ', ' + dout + '] -> [' + n + ', ' + heads + ', ' + hd + ']</code></p>' +
+        '<p class="ldetail-p">投影只是“把所有头排在一起”，之后要 reshape 成 ' + heads + ' 个头、每头 ' + hd + ' 维，各头独立算注意力 —— 这就是 RoPE 框标注 Q [' + n + ', ' + heads + ', ' + hd + '] 的来源。</p>' +
+
+        '<h4>⑤ 在 llama.cpp 里的实现</h4>' +
+        '<p class="ldetail-p"><code>Qcur = ggml_mul_mat(ctx0, layer.wq, cur);</code><br>' +
+          '<code>Qcur = ggml_reshape_3d(ctx0, Qcur, ' + hd + ', ' + heads + ', n_tokens);</code></p>' +
+        '<p class="ldetail-p">ggml_mul_mat 一次算完整批 token（$n$ 行一起），不是逐 token 循环；权重取自 GGUF 的 ' +
+          '<code>blk.' + layer + '.attn_q.weight</code>，形状 [' + din + ', ' + dout + ']。</p>' +
+
+        '<h4>⑥ 参数量</h4>' +
+        '<p class="ldetail-p">$' + din + ' \\times ' + dout + ' = ' + (din * dout).toLocaleString() + '$ 个权重；' +
+          'Qwen3 的 Q/K/V 投影都<b>没有 bias</b>（无加性项）。</p>' +
+
+        '<h4>⑦ 三个投影的对照</h4>' +
+        '<table class="ldetail-table"><thead><tr><th>投影</th><th>权重形状</th><th>输出</th><th>头数</th></tr></thead><tbody>' +
+        '<tr><td>Q proj</td><td>[' + din + ', ' + dout + ']</td><td>[' + n + ', ' + dout + ']</td><td>' + heads + '</td></tr>' +
+        '<tr><td>K proj</td><td>[' + din + ', ' + kde + ']</td><td>[' + n + ', ' + kde + ']</td><td>' + MODEL.kvHeads + '</td></tr>' +
+        '<tr><td>V proj</td><td>[' + din + ', ' + kde + ']</td><td>[' + n + ', ' + kde + ']</td><td>' + MODEL.kvHeads + '</td></tr>' +
+        '</tbody></table>' +
+        '<p class="ldetail-p">三者共用同一个输入 $x_{norm}$，但各有独立权重矩阵，<b>互不依赖</b>（页面里三条竖列由同一处分叉）。</p>' +
+      '</div>' +
+    '</div>';
+  }
+
+  // MHA / GQA / MQA 对照表：三者只差 K/V 的头数（KV cache 大小正比于它）
+  function kvHeadsTableHTML() {
+    var nl = MODEL.layers, ctx = KV_DEMO_CTX, hd = MODEL.headDim, nh = MODEL.heads, cur = MODEL.kvHeads;
+    var gb = function (kv) { return (2 * nl * ctx * kv * hd * 2 / 1e9).toFixed(2); };
+    var tag = function (kv) { return kv === cur ? ' <b>（本模型）</b>' : ''; };
+    var row = function (name, kv, note) {
+      return '<tr><td>' + name + tag(kv) + '</td><td>' + kv + '</td><td>' + (kv * hd) + '</td>' +
+             '<td>约 ' + gb(kv) + ' GB</td><td>' + (kv === 1 ? '1/' + nh : (kv === nh ? '1x' : '1/' + (nh / kv))) + '</td></tr>' +
+             (note ? '<tr><td colspan="5" class="kv-note">' + note + '</td></tr>' : '');
+    };
+    return '<table class="ldetail-table"><thead><tr><th>方案</th><th>n_kv_heads</th><th>K/V 维度</th><th>KV cache（估算）</th><th>相对 MHA</th></tr></thead><tbody>' +
+      row('MHA 多头注意力', nh) +
+      row('GQA 分组查询', cur, '每 ' + (nh / cur) + ' 个 Q 头共享 1 组 K/V') +
+      row('MQA 多查询注意力', 1, '所有 ' + nh + ' 个 Q 头共享同一份 K/V') +
+      '</tbody></table>' +
+      '<p class="ldetail-p">本模型 <code>' + MODEL.arch + '.attention.head_count_kv</code> = ' + cur +
+        '，介于 1 与 ' + nh + ' 之间，属于 <b>GQA</b>（每 ' + (nh / cur) + ' 个 Q 头共享 1 组 K/V）。</p>' +
+      '<p class="ldetail-p">判定方法（llama.cpp 只用 head_count_kv 一个字段）：' +
+        '<code>kv == head_count</code> 为 MHA、<code>kv == 1</code> 为 MQA、其余为 GQA。' +
+        '页面上 Q 输出 ' + (nh * hd) + ' 维而 K/V 只 ' + (cur * hd) + ' 维，比值 ' + (nh / cur) + ' 就是每组共享的头数。</p>';
+  }
+
+  // K proj：x_norm 到 K 的线性投影（GQA 下头数少于 Q）
+  function detailKProj(layer) {
+    var n = tokenCount();
+    var din = MODEL.hidden, nh = MODEL.heads, hd = MODEL.headDim, kv = MODEL.kvHeads;
+    var dq = nh * hd, dk = kv * hd;
+    var src = (layer != null && layer >= 0) ? '<span class="ldetail-src">来自 blk.' + layer + '.</span> ' : '';
+    return '<div class="ldetail" id="layer-detail">' +
+      '<div class="ldetail-head">' +
+        '<span>' + src + 'K proj · 键投影（Key projection）</span>' +
+        '<span class="ldetail-hint">再点一次算子名可收起</span>' +
+      '</div>' +
+      '<div class="ldetail-body">' +
+        '<p class="ldetail-p"><b>作用</b>：把 x_norm 投影成 Key —— 每个 token 的“索引标签”，后续用 Q 与它做点积打分（“我有什么可供匹配”）。</p>' +
+        '<p class="ldetail-p"><b>输入 / 输出</b>：$x_{norm} \\in \\mathbb{R}^{n \\times ' + din + '}$，$W_k \\in \\mathbb{R}^{' + din + ' \\times ' + dk + '}$，输出 $K \\in \\mathbb{R}^{n \\times ' + dk + '}$。</p>' +
+
+        '<h4>① 矩阵乘法</h4>' +
+        '$$ K = x_{norm} \\cdot W_k $$' +
+        '$$ K_{t,j} = \\sum_{k=1}^{' + din + '} x_{norm}[t,k] \\cdot W_k[k,j] $$' +
+
+        '<h4>② 形状流转</h4>' +
+        '<p class="ldetail-p"><code>[' + n + ', ' + din + '] × [' + din + ', ' + dk + '] -> [' + n + ', ' + dk + ']</code></p>' +
+        '<p class="ldetail-p">同样是每个 token 独立做一次投影，token 维 $n$ 不变。</p>' +
+
+        '<h4>③ 为什么 K 是 ' + dk + '，而 Q 是 ' + dq + '？</h4>' +
+        '<p class="ldetail-p">因为 K/V 的头数可以和 Q 不同：$d^K_{out} = n_{kv} \\times d_{head} = ' + kv + ' \\times ' + hd + ' = ' + dk + '$，' +
+          '而 Q 是 $' + nh + ' \\times ' + hd + ' = ' + dq + '$。这就是下面要讲的 MHA / GQA / MQA。</p>' +
+
+        '<h4>④ 三种头数配置：MHA / GQA / MQA</h4>' +
+        '<p class="ldetail-p">三者<b>只差 K/V 的头数</b>，Q 始终是 ' + nh + ' 头。KV cache 大小正比于 K/V 头数，因此这是“质量 vs 显存”的旋钮：</p>' +
+        kvHeadsTableHTML() +
+        '<p class="ldetail-p">KV cache 公式：$2 \\times n_{layer} \\times n_{ctx} \\times n_{kv} \\times d_{head} \\times \\mathrm{sizeof(dtype)}$' +
+          '（K、V 各一份）。这里按 ' + MODEL.layers + ' 层、n_ctx=' + KV_DEMO_CTX + '、fp16 估算，为<b>计算值</b>。</p>' +
+        '<p class="ldetail-p">出处：MQA 见 Shazeer 2019, arXiv:1911.02150；GQA 见 Ainslie et al. 2023, arXiv:2305.13245。</p>' +
+
+        '<h4>⑤ 拆成多头 + RoPE</h4>' +
+        '<p class="ldetail-p"><code>[' + n + ', ' + dk + '] -> [' + n + ', ' + kv + ', ' + hd + ']</code>，然后 K 也要<b>做 RoPE 旋转</b>（V 不做）。</p>' +
+
+        '<h4>⑥ 写入 KV cache</h4>' +
+        '<p class="ldetail-p">K 算完不丢弃：与 V 一起按位置存进 KV cache，后续每生成一个新 token 都复用历史 K/V，避免重算。</p>' +
+
+        '<h4>⑦ 在 llama.cpp 里的实现</h4>' +
+        '<p class="ldetail-p"><code>Kcur = ggml_mul_mat(ctx0, layer.wk, cur);</code><br>' +
+          '<code>Kcur = ggml_reshape_3d(ctx0, Kcur, ' + hd + ', ' + kv + ', n_tokens);</code><br>' +
+          '写入：<code>kv_self.k = ggml_cpy(...)</code>（或 view，取决于后端）</p>' +
+
+        '<h4>⑧ 参数量</h4>' +
+        '<p class="ldetail-p">$' + din + ' \\times ' + dk + ' = ' + (din * dk).toLocaleString() + '$ 个权重（无 bias）。' +
+          '对比 Q proj 的 ' + (din * dq).toLocaleString() + '，因为 K 头数只有 Q 的 1/' + (nh / kv) + '。</p>' +
+      '</div>' +
+    '</div>';
+  }
+
+  // V proj：x_norm 到 V 的线性投影（与 K 同头数，但不做 RoPE）
+  function detailVProj(layer) {
+    var n = tokenCount();
+    var din = MODEL.hidden, nh = MODEL.heads, hd = MODEL.headDim, kv = MODEL.kvHeads;
+    var dv = kv * hd;
+    var src = (layer != null && layer >= 0) ? '<span class="ldetail-src">来自 blk.' + layer + '.</span> ' : '';
+    return '<div class="ldetail" id="layer-detail">' +
+      '<div class="ldetail-head">' +
+        '<span>' + src + 'V proj · 值投影（Value projection）</span>' +
+        '<span class="ldetail-hint">再点一次算子名可收起</span>' +
+      '</div>' +
+      '<div class="ldetail-body">' +
+        '<p class="ldetail-p"><b>作用</b>：把 x_norm 投影成 Value —— 每个 token 实际携带的“内容”，最终按注意力权重加权求和（“我提供什么”）。</p>' +
+        '<p class="ldetail-p"><b>输入 / 输出</b>：$x_{norm} \\in \\mathbb{R}^{n \\times ' + din + '}$，$W_v \\in \\mathbb{R}^{' + din + ' \\times ' + dv + '}$，输出 $V \\in \\mathbb{R}^{n \\times ' + dv + '}$。</p>' +
+
+        '<h4>① 矩阵乘法</h4>' +
+        '$$ V = x_{norm} \\cdot W_v $$' +
+        '$$ V_{t,j} = \\sum_{k=1}^{' + din + '} x_{norm}[t,k] \\cdot W_v[k,j] $$' +
+
+        '<h4>② 形状流转</h4>' +
+        '<p class="ldetail-p"><code>[' + n + ', ' + din + '] × [' + din + ', ' + dv + '] -> [' + n + ', ' + dv + ']</code></p>' +
+
+        '<h4>③ 输出维度与 K 相同</h4>' +
+        '<p class="ldetail-p">$d^V_{out} = n_{kv} \\times d_{head} = ' + kv + ' \\times ' + hd + ' = ' + dv + '$，与 K 一致（V 与 K 成对）；' +
+          '而 Q 是 ' + nh + ' 头、' + (nh * hd) + ' 维。</p>' +
+
+        '<h4>④ 三种头数配置：MHA / GQA / MQA</h4>' +
+        '<p class="ldetail-p">V 与 K 使用<b>同一套头数配置</b>（它们总是一起被缓存，所以头数必须一致）。Q 固定 ' + nh + ' 头：</p>' +
+        kvHeadsTableHTML() +
+        '<p class="ldetail-p">MQA 见 Shazeer 2019, arXiv:1911.02150；GQA 见 Ainslie et al. 2023, arXiv:2305.13245。</p>' +
+
+        '<h4>⑤ V 与 K 的关键区别：不做 RoPE</h4>' +
+        '<p class="ldetail-p">RoPE 是有位置含义的旋转，只作用于需要“按位置匹配”的 Q 和 K；' +
+          'V 是纯内容，位置信息已经通过注意力权重（来自 Q·K）体现，因此 <b>V 不旋转</b>。页面里 V 列没有 RoPE 框就是这个原因。</p>' +
+
+        '<h4>⑥ 写入 KV cache</h4>' +
+        '<p class="ldetail-p">V 与 K 一起按位置存入 KV cache，供后续 token 复用。</p>' +
+
+        '<h4>⑦ 在 llama.cpp 里的实现</h4>' +
+        '<p class="ldetail-p"><code>Vcur = ggml_mul_mat(ctx0, layer.wv, cur);</code><br>' +
+          '<code>Vcur = ggml_reshape_3d(ctx0, Vcur, ' + hd + ', ' + kv + ', n_tokens);</code><br>' +
+          '写入：<code>kv_self.v = ggml_cpy(...)</code></p>' +
+
+        '<h4>⑧ 参数量</h4>' +
+        '<p class="ldetail-p">$' + din + ' \\times ' + dv + ' = ' + (din * dv).toLocaleString() + '$ 个权重（无 bias），与 K proj 相同。</p>' +
       '</div>' +
     '</div>';
   }
@@ -880,6 +1071,17 @@
     var qd = MODEL.heads * MODEL.headDim;    // Q 投影输出维度
     var kvd = MODEL.kvHeads * MODEL.headDim; // K/V 投影输出维度
     var F = MODEL.ffn;
+    // 权重矩阵形状：优先取所选模型第 i 层的真实张量形状，未加载模型时用派生值兜底
+    var wDims = function (tname, fallback) {
+      var ts = MODEL.tensors;
+      if (ts && ts.length) {
+        var full = 'blk.' + i + '.' + tname;
+        for (var k = 0; k < ts.length; k++) {
+          if (ts[k].name === full && ts[k].dims && ts[k].dims.length) return ts[k].dims.slice();
+        }
+      }
+      return fallback;
+    };
 
     // 行单元：{name, op, dim, cls} 普通行 | {fork:true} 分叉行 | {tri:[...]} 三列并发行
     var rows = [
@@ -888,15 +1090,15 @@
       { fork: true },
       { tri: [
         { blocks: [
-            { name: 'Q proj', op: 'x_norm · Wq', dim: 'Q [' + n + ', ' + qd + ']', cls: 'attn' },
+            { name: 'Q proj', op: 'x_norm · Wq', w: wDims('attn_q.weight', [H, qd]), dim: 'Q [' + n + ', ' + qd + ']', cls: 'attn', detail: 'Q proj' },
             { name: 'RoPE', op: '旋转 Q（前 ' + MODEL.headDim + ' 维）', dim: 'Q [' + n + ', ' + MODEL.heads + ', ' + MODEL.headDim + ']', cls: 'attn' }
           ], tag: '' },
         { blocks: [
-            { name: 'K proj', op: 'x_norm · Wk', dim: 'K [' + n + ', ' + kvd + ']', cls: 'attn' },
+            { name: 'K proj', op: 'x_norm · Wk', w: wDims('attn_k.weight', [H, kvd]), dim: 'K [' + n + ', ' + kvd + ']', cls: 'attn', detail: 'K proj' },
             { name: 'RoPE', op: '旋转 K（前 ' + MODEL.headDim + ' 维）', dim: 'K [' + n + ', ' + MODEL.kvHeads + ', ' + MODEL.headDim + ']', cls: 'attn' }
           ], tag: '写入 KV cache' },
         { blocks: [
-            { name: 'V proj', op: 'x_norm · Wv', dim: 'V [' + n + ', ' + kvd + ']', cls: 'attn' }
+            { name: 'V proj', op: 'x_norm · Wv', w: wDims('attn_v.weight', [H, kvd]), dim: 'V [' + n + ', ' + kvd + ']', cls: 'attn', detail: 'V proj' }
           ], tag: '写入 KV cache' }
       ] },
       { merge: true },
@@ -912,7 +1114,7 @@
       { name: '输出', op: '→ 下一层', dim: '[' + n + ', ' + H + ']', cls: 'input' }
     ];
 
-    var H_STEP = 30, H_FORK = 72, H_TRI = 160, H_CONN = 18;
+    var H_STEP = 30, H_FORK = 72, H_TRI = 210, H_CONN = 18;
     var y = 0, y0 = 0, yRes1 = 0, yRes2 = 0;
 
     var html = '<div class="lflow">';
@@ -935,8 +1137,10 @@
             var inner = '';
             col.blocks.forEach(function (b, bi) {
               if (bi > 0) inner += '<div class="ltri-conn"><i></i></div>';
-              inner += '<div class="ltri-box">' +
-                         '<span class="ltri-name ' + b.cls + '">' + esc(b.name) + '</span>' +
+              inner += '<div class="ltri-box' + (b.detail ? ' clickable' : '') + '"' +
+                         (b.detail ? ' data-detail="' + esc(b.detail) + '" data-layer="' + i + '" title="点击查看数学过程"' : '') + '>' +
+                         '<span class="ltri-name ' + b.cls + '">' + esc(b.name) +
+                           (b.w ? '<span class="ltri-wdim">[' + b.w.join(', ') + ']</span>' : '') + '</span>' +
                          '<span class="ltri-op">' + esc(b.op) + '</span>' +
                          '<span class="ltri-dim">' + esc(b.dim) + '</span>' +
                        '</div>';

@@ -39,20 +39,25 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+// llama_context 的实现结构体（公共 API 中为不透明句柄 llama_context*），
+// 持有单个模型实例推理所需的全部运行时状态。一次 llama_decode()/encode() 前向：
+// 将 batch 拆为 ubatch，按需构图（graph），经后端调度器（sched）分发到 CPU/GPU 计算，
+// 结果写回输出缓冲（logits/embeddings/采样结果），供后续 API 读取。
+// 主要组成：模型与上下文参数引用、KV cache（memory）、计算图与后端调度器、
+// 输出缓冲、采样器（sampling）、LoRA/cvec 适配器、线程池、性能统计、训练辅助（opt）等。
 struct llama_context {
-    // init scheduler and compute buffers, reserve worst-case graphs
+    // 初始化调度器与计算缓冲，按最坏情况预留计算图
     llama_context(
             const llama_model & model,
                   llama_context_params params);
 
     ~llama_context();
 
-    // reserve a new backend scheduler (if needed)
-    // for example, when:
-    //   - changing loras
-    //   - changing samplers
-    //   - changing attention type
-    //   - etc.
+    // 重新预留后端调度器（必要时），例如发生以下变化时：
+    //   - 更换 LoRA 适配器
+    //   - 更换采样器
+    //   - 改变注意力类型
+    //   - 等
     void sched_reserve();
 
     void synchronize();
@@ -73,7 +78,7 @@ struct llama_context {
 
     llama_memory_t get_memory() const;
 
-    // return true if the memory was updated
+    // 返回 memory（KV cache）是否被更新
     bool memory_update(bool optimize);
 
     enum llama_pooling_type pooling_type() const;
@@ -130,10 +135,9 @@ struct llama_context {
                 int32_t   il_start,
                 int32_t   il_end);
 
-    // process a single ubatch with a specific graph type
-    // if memory_context is provided, it will be applied first to the context's memory
-    // ret contains the status of the graph computation
-    // returns nullptr only if ret != GGML_STATUS_SUCCESS
+    // 用指定的图类型处理一个 ubatch
+    // 若提供 memory_context，会先将其应用到本上下文的 memory 上
+    // ret 保存图计算的状态；仅当 ret != GGML_STATUS_SUCCESS 时返回 nullptr
     llm_graph_result * process_ubatch(
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
@@ -144,7 +148,7 @@ struct llama_context {
     int decode(const llama_batch & batch_inp);
 
     //
-    // state save/load
+    // 状态保存/加载：导出或恢复 memory（KV cache）与相关内存状态
     //
 
     size_t state_get_size();
@@ -181,7 +185,7 @@ struct llama_context {
                 size_t   n_token_count);
 
     //
-    // perf
+    // 性能统计
     //
 
     llama_perf_context_data perf_get_data() const;
@@ -190,7 +194,7 @@ struct llama_context {
     llama_memory_breakdown memory_breakdown() const;
 
     //
-    // training
+    // 训练（llama-opt）
     //
 
     void opt_init(struct llama_model * model, struct llama_opt_params lopt_params);
@@ -218,7 +222,7 @@ struct llama_context {
 
 private:
     //
-    // output
+    // 输出管理：logits/embeddings/采样结果缓冲的预留、行映射与读取
     //
 
     // Make sure enough space is available for outputs.
@@ -235,7 +239,7 @@ private:
     void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
 
     //
-    // graph
+    // 计算图：构图、预留与执行
     //
 
 public:
@@ -274,7 +278,7 @@ private:
     size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
 
     //
-    // members
+    // 数据成员
     //
 
     const llama_model & model;
@@ -348,7 +352,7 @@ private:
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
-    // training
+    // 训练（llama-opt）上下文
     ggml_opt_context_t opt_ctx = nullptr;
 
     ggml_threadpool_t threadpool       = nullptr;
@@ -378,7 +382,7 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
-    // perf
+    // 性能统计
     mutable int64_t t_start_us  = 0;
     mutable int64_t t_load_us   = 0;
     mutable int64_t t_p_eval_us = 0;

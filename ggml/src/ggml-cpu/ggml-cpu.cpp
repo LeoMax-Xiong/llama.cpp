@@ -167,11 +167,18 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
     GGML_UNUSED(backend);
 }
 
+// CPU 后端的图执行入口（后端接口表 .graph_compute 回调），被调度器每个 split 或直接调用方执行图时使用。
+// 即算即规划：每次执行都先做计算规划（ggml_graph_plan），再按计划执行（ggml_graph_compute）。
+// 流程：从后端上下文取线程/工作缓冲配置 -> 规划图（确定各节点的工作缓冲大小 work_size）->
+//       必要时扩容工作缓冲并挂到计划上 -> 带上中止回调/参考实现标志 -> 多线程执行整张图。
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    // CPU 后端上下文：持有线程数、线程池、可复用的工作缓冲与中止回调等
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
+    // 规划整张图：为每个节点选定实现、拆分线程任务，并算出所需工作缓冲大小 work_size
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
 
+    // 现有工作缓冲不够大时扩容（跨调用复用，避免反复分配）
     if (cpu_ctx->work_size < cplan.work_size) {
         delete[] cpu_ctx->work_data;
         cpu_ctx->work_data = new uint8_t[cplan.work_size];
@@ -183,10 +190,12 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     }
     cplan.work_data = (uint8_t *)cpu_ctx->work_data;
 
+    // 传入中止回调（回调返回 true 时中止计算）与参考实现标志（use_ref：调试时只用参考实现）
     cplan.abort_callback      = cpu_ctx->abort_callback;
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cplan.use_ref             = cpu_ctx->use_ref;
 
+    // 按计划在 CPU 上多线程执行整张图
     return ggml_graph_compute(cgraph, &cplan);
 }
 

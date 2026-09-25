@@ -344,8 +344,8 @@ main {
 .lstep {
   height: 30px;
   display: grid;
-  /* 第 1 列留空 186px，节点固定在第 2 列（172px）→ 节点中心恒为 272px，与 K proj 对齐 */
-  grid-template-columns: 186px 172px minmax(140px, 1fr) auto;
+  /* 第 1 列 174px + gap 12px = 186px，使节点列中心落在 272px，与三列中间列(K)、圆点、箭头对齐 */
+  grid-template-columns: 174px 172px minmax(140px, 1fr) auto;
   gap: 12px;
   align-items: center;
 }
@@ -401,7 +401,7 @@ main {
 
 /* 三列并发行（Q / K / V 并发）：每列是一条垂直链，内容顶部对齐 */
 .lstep-tri {
-  height: 160px;
+  height: 210px;
   display: flex;
   flex-direction: column;
   justify-content: flex-start;
@@ -423,6 +423,7 @@ main {
 .ltri-box {
   display: flex;
   flex-direction: column;
+  flex-shrink: 0;
   gap: 3px;
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -436,15 +437,18 @@ main {
 .ltri-name.norm  { color: var(--pink); }
 .ltri-name.input { color: var(--blue); }
 .ltri-name.resid { color: var(--green); }
+/* 算子名后的权重矩阵形状：比算子名小一号并弱化，避免抢视觉 */
+.ltri-wdim { font-family: var(--mono); font-size: 9.5px; font-weight: 400; color: var(--text-faint); margin-left: 4px; }
 .ltri-op  { font-family: var(--mono); font-size: 10.5px; color: var(--text-faint); }
 .ltri-dim { font-family: var(--mono); font-size: 11px; color: var(--cyan); }
-.ltri-tag { font-family: var(--mono); font-size: 10px; color: var(--text-faint); text-align: center; }
+.ltri-tag { font-family: var(--mono); font-size: 10px; color: var(--text-faint); text-align: center; flex-shrink: 0; margin-top: 8px; }
 
 /* 列内部：圆点 → 竖线 → 箭头（连接列内两个模块） */
+/* 模块间连线区：固定 22px 且不参与 flex 收缩，保证 Q proj 与 RoPE 之间始终有间隙 */
 .ltri-conn {
   position: relative;
   width: 100%;
-  height: 18px;
+  flex: 0 0 22px;
 }
 .ltri-conn::before {
   content: '';
@@ -521,6 +525,8 @@ main {
 
 /* 可点击的算子 */
 .lstep-node.clickable { cursor: pointer; }
+.ltri-box.clickable { cursor: pointer; }
+.ltri-box.clickable:hover { border-color: var(--purple); }
 .lstep-node.clickable:hover {
   border-color: var(--yellow);
   color: var(--yellow);
@@ -585,6 +591,8 @@ main {
   color: #a8b1bb;
 }
 .ldetail-table th { background: var(--bg-elev); color: var(--text-dim); font-weight: 600; }
+/* 对照表里的补充说明行（如 GQA 每组共享几个 Q 头） */
+.kv-note { font-size: 10.5px; color: var(--text-faint); text-align: left; padding: 2px 8px 6px; }
 
 /* MathJax 渲染结果跟随页面配色 */
 .ldetail mjx-container { color: #c9d1d9 !important; }
